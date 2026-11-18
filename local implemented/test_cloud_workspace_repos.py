@@ -1,0 +1,1218 @@
+"""Tests for repository cloning and skill loading in OpenHandsCloudWorkspace."""
+
+import logging
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+# Import from SDK repo module (cloud workspace re-exports these)
+from openhands.sdk.workspace.repo import (
+    CloneResult,
+    GitProvider,
+    RepoMapping,
+    RepoSource,
+    _bitbucket_dc_clone,
+    _bitbucket_dc_clone_url,
+    _build_clone_url,
+    _detect_provider_from_url,
+    _extract_repo_name,
+    _get_unique_dir_name,
+    _is_commit_sha,
+    _sanitize_dir_name,
+    clone_repos,
+    get_repos_context,
+)
+
+
+class TestRepoSource:
+    """Tests for RepoSource model."""
+
+    # --- Short URL format (requires provider) ---
+
+    def test_short_url_with_provider(self):
+        """Test RepoSource with short URL and explicit provider."""
+        repo = RepoSource(url="owner/repo", provider="github")
+        assert repo.url == "owner/repo"
+        assert repo.provider == "github"
+        assert repo.get_provider() == GitProvider.GITHUB
+
+    def test_short_url_with_ref_and_provider(self):
+        """Test RepoSource with short URL, ref, and provider."""
+        repo = RepoSource(url="owner/repo", ref="main", provider="gitlab")
+        assert repo.url == "owner/repo"
+        assert repo.ref == "main"
+        assert repo.get_provider() == GitProvider.GITLAB
+
+    def test_short_url_without_provider_rejected(self):
+        """Test that short URL without provider is rejected."""
+        with pytest.raises(ValueError, match="requires explicit 'provider' field"):
+            RepoSource(url="owner/repo")
+
+    def test_short_url_string_without_provider_rejected(self):
+        """Test that string input without provider is rejected."""
+        with pytest.raises(ValueError, match="requires explicit 'provider' field"):
+            RepoSource.model_validate("owner/repo")
+
+    def test_short_url_dict_without_provider_rejected(self):
+        """Test that dict input without provider is rejected."""
+        with pytest.raises(ValueError, match="requires explicit 'provider' field"):
+            RepoSource.model_validate({"url": "owner/repo", "ref": "v1.0"})
+
+    # --- Full URL format (provider auto-detected) ---
+
+    def test_full_https_url_github(self):
+        """Test RepoSource with full GitHub HTTPS URL."""
+        repo = RepoSource(url="https://github.com/owner/repo")
+        assert repo.url == "https://github.com/owner/repo"
+        assert repo.provider is None
+        assert repo.get_provider() == GitProvider.GITHUB
+
+    def test_full_https_url_gitlab(self):
+        """Test RepoSource with full GitLab HTTPS URL."""
+        repo = RepoSource(url="https://gitlab.com/owner/repo")
+        assert repo.provider is None
+        assert repo.get_provider() == GitProvider.GITLAB
+
+    def test_full_https_url_bitbucket(self):
+        """Test RepoSource with full Bitbucket HTTPS URL."""
+        repo = RepoSource(url="https://bitbucket.org/owner/repo")
+        assert repo.provider is None
+        assert repo.get_provider() == GitProvider.BITBUCKET
+
+    def test_full_https_url_azure_devops(self):
+        """Test RepoSource with a full Azure DevOps HTTPS URL."""
+        repo = RepoSource(url="https://dev.azure.com/org/project/_git/repo")
+        assert repo.provider is None
+        assert repo.get_provider() == GitProvider.AZURE_DEVOPS
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # The URL Azure DevOps shows in its Clone dialog names the organization.
+            pytest.param(
+                "https://org@dev.azure.com/org/project/_git/repo", id="clone_dialog_url"
+            ),
+            # Organizations on {org}.visualstudio.com are Azure DevOps too.
+            pytest.param(
+                "https://org.visualstudio.com/project/_git/repo", id="legacy_host"
+            ),
+        ],
+    )
+    def test_azure_devops_url_variant(self, url):
+        repo = RepoSource(url=url)
+        assert repo.get_provider() == GitProvider.AZURE_DEVOPS
+
+    def test_git_ssh_url(self):
+        """Test RepoSource with git SSH URL (contains github.com)."""
+        repo = RepoSource(url="git@github.com:owner/repo.git")
+        assert repo.url == "git@github.com:owner/repo.git"
+        assert repo.get_provider() == GitProvider.GITHUB
+
+    # --- Provider field behavior ---
+
+    def test_provider_explicit_overrides_detection(self):
+        """Test that explicit provider is used even with full URL."""
+        # User explicitly says gitlab even though URL is github
+        # This could be intentional (mirror, etc.)
+        repo = RepoSource(url="https://github.com/owner/repo", provider="gitlab")
+        assert repo.get_provider() == GitProvider.GITLAB
+
+    @pytest.mark.parametrize(
+        ("provider", "expected"),
+        [
+            pytest.param("github", "GITHUB_TOKEN", id="github"),
+            pytest.param("gitlab", "GITLAB_TOKEN", id="gitlab"),
+            pytest.param("bitbucket", "BITBUCKET_TOKEN", id="bitbucket"),
+        ],
+    )
+    def test_provider_token_name(self, provider, expected):
+        repo = RepoSource(url="owner/repo", provider=provider)
+        assert repo.get_token_name() == expected
+
+    def test_provider_azure_devops_token_name(self):
+        """Test Azure DevOps token name."""
+        repo = RepoSource(url="https://dev.azure.com/org/project/_git/repo")
+        assert repo.get_token_name() == "azure_devops_token"
+
+    @pytest.mark.parametrize(
+        ("url", "provider"),
+        [
+            # Azure DevOps needs org/project/repo, so owner/repo is refused.
+            pytest.param("owner/repo", "azure_devops", id="azure_devops"),
+            # Data Center has no public host, so PROJ/repo alone cannot be cloned.
+            pytest.param("PROJ/repo", "bitbucket_data_center", id="bitbucket_dc"),
+        ],
+    )
+    def test_short_url_rejected_for_provider_without_public_host(self, url, provider):
+        with pytest.raises(ValueError, match="need a full URL"):
+            RepoSource(url=url, provider=provider)
+
+    def test_bitbucket_dc_token_name(self):
+        """A Bitbucket Data Center repo uses its own token, not Bitbucket Cloud's."""
+        repo = RepoSource(
+            url="https://bitbucket.example.com/scm/PROJ/repo.git",
+            provider="bitbucket_data_center",
+        )
+        assert repo.get_provider() == GitProvider.BITBUCKET_DATA_CENTER
+        assert repo.get_token_name() == "bitbucket_data_center_token"
+
+    def test_bitbucket_dc_url_not_detected_without_provider(self):
+        """A Data Center host is not recognized, so it never gets a token unasked."""
+        repo = RepoSource(url="https://bitbucket.example.com/scm/PROJ/repo.git")
+        with pytest.raises(ValueError, match="Cannot determine provider"):
+            repo.get_provider()
+
+    # --- URL validation ---
+
+    def test_invalid_url_rejected(self):
+        """Test that invalid URLs are rejected."""
+        with pytest.raises(ValueError, match="URL must be"):
+            RepoSource(url="invalid-url-format", provider="github")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            pytest.param("owner/repo.name", id="dots"),
+            pytest.param("my-org/my-repo", id="dashes"),
+        ],
+    )
+    def test_url_with_punctuation_allowed(self, url):
+        repo = RepoSource(url=url, provider="github")
+        assert repo.url == url
+
+    def test_http_url_credentials_redacted_in_warning(self, caplog):
+        """The http->https normalization warning must not leak embedded creds."""
+        with caplog.at_level(logging.WARNING):
+            repo = RepoSource(url="http://oauth2:SUPERSECRET@github.com/owner/repo.git")
+        # The credential never reaches the logs...
+        assert "SUPERSECRET" not in caplog.text
+        assert "oauth2" not in caplog.text
+        assert "Converting HTTP URL to HTTPS" in caplog.text
+        assert "http://****@github.com/owner/repo.git" in caplog.text
+        # ...but normalization still happens on the stored value.
+        assert repo.url == "https://oauth2:SUPERSECRET@github.com/owner/repo.git"
+
+
+class TestProviderDetection:
+    """Tests for provider detection from URLs."""
+
+    def test_detect_github(self):
+        assert _detect_provider_from_url("https://github.com/o/r") == GitProvider.GITHUB
+
+    def test_detect_gitlab(self):
+        assert _detect_provider_from_url("https://gitlab.com/o/r") == GitProvider.GITLAB
+
+    def test_detect_bitbucket(self):
+        assert (
+            _detect_provider_from_url("https://bitbucket.org/o/r")
+            == GitProvider.BITBUCKET
+        )
+
+    def test_detect_azure_devops(self):
+        assert (
+            _detect_provider_from_url("https://dev.azure.com/o/p/_git/r")
+            == GitProvider.AZURE_DEVOPS
+        )
+        # The Clone dialog URL names the organization as the user.
+        assert (
+            _detect_provider_from_url("https://o@dev.azure.com/o/p/_git/r")
+            == GitProvider.AZURE_DEVOPS
+        )
+        assert (
+            _detect_provider_from_url("https://o.visualstudio.com/p/_git/r")
+            == GitProvider.AZURE_DEVOPS
+        )
+
+    def test_detect_unknown(self):
+        assert _detect_provider_from_url("https://example.com/o/r") is None
+        assert _detect_provider_from_url("owner/repo") is None
+        assert _detect_provider_from_url("https://visualstudio.com/p/_git/r") is None
+        assert _detect_provider_from_url("https://dev.azure.com.evil.com/o/p") is None
+        assert _detect_provider_from_url("https://x.visualstudio.com.evil.com") is None
+
+
+class TestHelperFunctions:
+    """Tests for helper functions in repo module."""
+
+    def test_is_commit_sha_valid(self):
+        """Test detection of valid commit SHAs."""
+        assert _is_commit_sha("abc1234") is True
+        assert (
+            _is_commit_sha("abc1234567890abcdef1234567890abcdef12") is True
+        )  # 40 chars
+        assert _is_commit_sha("ABC1234") is True  # Case insensitive
+
+    def test_is_commit_sha_invalid(self):
+        """Test detection of invalid commit SHAs."""
+        assert _is_commit_sha(None) is False
+        assert _is_commit_sha("main") is False
+        assert _is_commit_sha("v1.0.0") is False
+        assert _is_commit_sha("abc123") is False  # Too short
+        assert _is_commit_sha("xyz1234") is False  # Invalid hex chars
+
+    def test_extract_repo_name_owner_repo(self):
+        """Test extracting repo name from owner/repo format."""
+        assert _extract_repo_name("owner/repo") == "repo"
+        assert _extract_repo_name("my-org/my-repo") == "my-repo"
+
+    def test_extract_repo_name_https_url(self):
+        """Test extracting repo name from HTTPS URLs."""
+        assert _extract_repo_name("https://github.com/owner/repo") == "repo"
+        assert _extract_repo_name("https://github.com/owner/repo.git") == "repo"
+        assert _extract_repo_name("https://gitlab.com/owner/repo") == "repo"
+
+    def test_extract_repo_name_azure_devops_url(self):
+        """Test extracting repo name from Azure DevOps URLs."""
+        assert _extract_repo_name("https://dev.azure.com/o/p/_git/repo") == "repo"
+        assert _extract_repo_name("https://o@dev.azure.com/o/p/_git/repo") == "repo"
+
+    def test_extract_repo_name_windows_file_url(self):
+        """Test extracting repo names from Windows file URLs."""
+        assert _extract_repo_name(r"file://C:\Users\user\work\repo") == "repo"
+
+    def test_extract_repo_name_ssh_url(self):
+        """Test extracting repo name from SSH URLs."""
+        assert _extract_repo_name("git@github.com:owner/repo.git") == "repo"
+        assert _extract_repo_name("git@gitlab.com:owner/repo") == "repo"
+
+    def test_sanitize_dir_name(self):
+        """Test directory name sanitization."""
+        assert _sanitize_dir_name("repo") == "repo"
+        assert _sanitize_dir_name("my-repo") == "my-repo"
+        assert _sanitize_dir_name("my.repo") == "my.repo"
+        assert _sanitize_dir_name("repo/name") == "repo_name"  # Invalid char
+        assert _sanitize_dir_name("...repo...") == "repo"  # Trim dots
+        assert _sanitize_dir_name("") == "repo"  # Empty -> default
+
+    def test_get_unique_dir_name(self):
+        """Test unique directory name generation."""
+        existing: set[str] = set()
+        assert _get_unique_dir_name("repo", existing) == "repo"
+
+        existing = {"repo"}
+        assert _get_unique_dir_name("repo", existing) == "repo_1"
+
+        existing = {"repo", "repo_1", "repo_2"}
+        assert _get_unique_dir_name("repo", existing) == "repo_3"
+
+    @pytest.mark.parametrize(
+        ("repo_url", "provider", "token", "expected"),
+        [
+            pytest.param(
+                "owner/repo",
+                GitProvider.GITHUB,
+                None,
+                "https://github.com/owner/repo.git",
+                id="github_owner_repo_no_token",
+            ),
+            pytest.param(
+                "owner/repo",
+                GitProvider.GITHUB,
+                "ghtoken123",
+                "https://ghtoken123@github.com/owner/repo.git",
+                id="github_owner_repo_with_token",
+            ),
+            pytest.param(
+                "https://github.com/owner/repo",
+                GitProvider.GITHUB,
+                "ghtoken123",
+                "https://ghtoken123@github.com/owner/repo",
+                id="github_https_with_token",
+            ),
+            pytest.param(
+                "owner/repo",
+                GitProvider.GITLAB,
+                "gltoken123",
+                "https://oauth2:gltoken123@gitlab.com/owner/repo.git",
+                id="gitlab_owner_repo_with_token",
+            ),
+            pytest.param(
+                "https://gitlab.com/owner/repo",
+                GitProvider.GITLAB,
+                "gltoken123",
+                "https://oauth2:gltoken123@gitlab.com/owner/repo",
+                id="gitlab_https_with_token",
+            ),
+            pytest.param(
+                "owner/repo",
+                GitProvider.BITBUCKET,
+                "bbtoken123",
+                "https://x-token-auth:bbtoken123@bitbucket.org/owner/repo.git",
+                id="bitbucket_with_token",
+            ),
+            pytest.param(
+                "https://github.com/owner/repo",
+                GitProvider.GITHUB,
+                None,
+                "https://github.com/owner/repo",
+                id="no_token_passthrough",
+            ),
+            # A URL naming only a user keeps it and gets the token as its password.
+            pytest.param(
+                "https://someone@github.com/owner/repo",
+                GitProvider.GITHUB,
+                "ghtoken123",
+                "https://someone:ghtoken123@github.com/owner/repo",
+                id="user_only_url_gets_token_as_password",
+            ),
+        ],
+    )
+    def test_build_clone_url(self, repo_url, provider, token, expected):
+        assert _build_clone_url(repo_url, provider, token) == expected
+
+    @pytest.mark.parametrize(
+        ("repo_url", "explicit_provider", "expected"),
+        [
+            pytest.param(
+                "https://gitlab.mycompany.com/owner/repo",
+                True,
+                "https://oauth2:gltoken123@gitlab.mycompany.com/owner/repo",
+                id="self_hosted_gitlab_with_explicit_provider",
+            ),
+            # An auto-detected provider must not inject a token into an
+            # unrelated host.
+            pytest.param(
+                "https://gitlab.mycompany.com/owner/repo",
+                False,
+                "https://gitlab.mycompany.com/owner/repo",
+                id="self_hosted_host_without_explicit_provider",
+            ),
+            # Host case and non-default port survive token injection.
+            pytest.param(
+                "https://GitLab.MyCompany.com:8443/owner/repo",
+                True,
+                "https://oauth2:gltoken123@gitlab.mycompany.com:8443/owner/repo",
+                id="self_hosted_host_is_normalized",
+            ),
+            # A URL that already carries credentials keeps its own.
+            pytest.param(
+                "https://oauth2:embedded@gitlab.mycompany.com/owner/repo",
+                True,
+                "https://oauth2:embedded@gitlab.mycompany.com/owner/repo",
+                id="existing_credentials_preserved",
+            ),
+        ],
+    )
+    def test_build_clone_url_self_hosted_gitlab(
+        self, repo_url, explicit_provider, expected
+    ):
+        url = _build_clone_url(
+            repo_url,
+            GitProvider.GITLAB,
+            "gltoken123",
+            explicit_provider=explicit_provider,
+        )
+        assert url == expected
+
+    @pytest.mark.parametrize("explicit_provider", [False, True])
+    def test_build_clone_url_lookalike_host_not_injected(self, explicit_provider):
+        """A lookalike of the public host never receives the token."""
+        url = _build_clone_url(
+            "https://github.com.evil.com/owner/repo",
+            GitProvider.GITHUB,
+            "ghtoken123",
+            explicit_provider=explicit_provider,
+        )
+        assert url == "https://github.com.evil.com/owner/repo"
+
+    @pytest.mark.parametrize(
+        ("repo_url", "expected"),
+        [
+            pytest.param(
+                "https://dev.azure.com/org/project/_git/repo",
+                "https://oauth2:adotoken@dev.azure.com/org/project/_git/repo",
+                id="with_token",
+            ),
+            # The Clone dialog's organization user stays, with the token as password.
+            pytest.param(
+                "https://org@dev.azure.com/org/project/_git/repo",
+                "https://org:adotoken@dev.azure.com/org/project/_git/repo",
+                id="keeps_organization_user",
+            ),
+            # An {org}.visualstudio.com host is Azure DevOps' own and gets the token.
+            pytest.param(
+                "https://org.visualstudio.com/project/_git/repo",
+                "https://oauth2:adotoken@org.visualstudio.com/project/_git/repo",
+                id="legacy_host",
+            ),
+        ],
+    )
+    def test_build_clone_url_azure_devops(self, repo_url, expected):
+        url = _build_clone_url(repo_url, GitProvider.AZURE_DEVOPS, "adotoken")
+        assert url == expected
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://dev.azure.com.evil.com/org/project/_git/repo",
+            "https://org.visualstudio.com.evil.com/project/_git/repo",
+        ],
+    )
+    @pytest.mark.parametrize("explicit_provider", [False, True])
+    def test_build_clone_url_azure_devops_lookalike_not_injected(
+        self, url, explicit_provider
+    ):
+        """Lookalikes of either Azure DevOps host never receive the token."""
+        assert (
+            _build_clone_url(
+                url,
+                GitProvider.AZURE_DEVOPS,
+                "adotoken",
+                explicit_provider=explicit_provider,
+            )
+            == url
+        )
+
+    def test_build_clone_url_bitbucket_cloud_token_stays_on_bitbucket_org(self):
+        """A Data Center URL labelled `bitbucket` never gets the Cloud token."""
+        url = "https://bitbucket.example.com/scm/PROJ/repo.git"
+        assert (
+            _build_clone_url(
+                url, GitProvider.BITBUCKET, "cloudtoken", explicit_provider=True
+            )
+            == url
+        )
+
+
+class TestBitbucketDataCenterClone:
+    """Clone URLs and credentials for Bitbucket Data Center."""
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            (
+                "https://bb.example.com/scm/PROJ/repo.git",
+                "https://bb.example.com/scm/PROJ/repo.git",
+            ),
+            (
+                "https://bb.example.com/projects/PROJ/repos/repo/browse?at=main",
+                "https://bb.example.com/scm/PROJ/repo.git",
+            ),
+            (
+                "https://bb.example.com/users/alice/repos/notes",
+                "https://bb.example.com/scm/~alice/notes.git",
+            ),
+            (
+                "https://example.com:7990/bitbucket/projects/PROJ/repos/repo",
+                "https://example.com:7990/bitbucket/scm/PROJ/repo.git",
+            ),
+            (
+                "https://bb.example.com/scm/~alice/notes.git",
+                "https://bb.example.com/scm/~alice/notes.git",
+            ),
+        ],
+    )
+    def test_clone_url(self, url, expected):
+        assert _bitbucket_dc_clone_url(url) == expected
+
+    @pytest.mark.parametrize("token", ["dctoken", "x-token-auth:dctoken"])
+    def test_access_token_sent_as_bearer_header(self, token):
+        """Access and OAuth tokens go in a host-scoped header, not the URL."""
+        url, config = _bitbucket_dc_clone(
+            "https://bb.example.com:8443/scm/PROJ/repo.git", token
+        )
+        assert url == "https://bb.example.com:8443/scm/PROJ/repo.git"
+        assert config == {
+            "http.https://bb.example.com:8443/.extraHeader": (
+                "Authorization: Bearer dctoken"
+            )
+        }
+
+    def test_username_token_sent_as_basic_auth(self):
+        """A `username:token` credential is URL-encoded into the clone URL."""
+        url, config = _bitbucket_dc_clone(
+            "https://bb.example.com/projects/PROJ/repos/repo", "alice@corp:p/ss"
+        )
+        assert url == "https://alice%40corp:p%2Fss@bb.example.com/scm/PROJ/repo.git"
+        assert config == {}
+
+    def test_clone_dialog_user_kept(self):
+        """The user Data Center's Clone dialog puts in the URL stays."""
+        url, config = _bitbucket_dc_clone(
+            "https://alice@bb.example.com/scm/PROJ/repo.git", "dctoken"
+        )
+        assert url == "https://alice@bb.example.com/scm/PROJ/repo.git"
+        assert config == {
+            "http.https://bb.example.com/.extraHeader": "Authorization: Bearer dctoken"
+        }
+
+    def test_no_token(self):
+        url, config = _bitbucket_dc_clone(
+            "https://bb.example.com/scm/PROJ/repo.git", None
+        )
+        assert url == "https://bb.example.com/scm/PROJ/repo.git"
+        assert config == {}
+
+    def test_git_applies_header_to_repo_host_only(self, tmp_path):
+        """Real git reads the environment config for the repo's host alone."""
+        import subprocess
+
+        from openhands.sdk.workspace.repo import _git_config_env
+
+        _, config = _bitbucket_dc_clone(
+            "https://bb.example.com/scm/PROJ/repo.git", "dctoken"
+        )
+        env = _git_config_env(config)
+        assert env is not None
+        env["HOME"] = str(tmp_path)
+
+        def header_for(url: str) -> str:
+            return subprocess.run(
+                ["git", "config", "--get-urlmatch", "http.extraHeader", url],
+                capture_output=True,
+                text=True,
+                env=env,
+            ).stdout.strip()
+
+        assert (
+            header_for("https://bb.example.com/scm/PROJ/repo.git")
+            == "Authorization: Bearer dctoken"
+        )
+        assert header_for("https://bitbucket.org/owner/repo.git") == ""
+
+
+class TestGetReposContext:
+    """Tests for get_repos_context function."""
+
+    def test_empty_mappings(self):
+        """Test that empty mappings return empty string."""
+        assert get_repos_context({}) == ""
+
+    def test_single_repo(self):
+        """Test context generation for single repo."""
+        mappings = {
+            "owner/repo": RepoMapping(
+                url="owner/repo",
+                dir_name="repo",
+                local_path="/workspace/project/repo",
+                ref=None,
+            )
+        }
+        context = get_repos_context(mappings)
+        assert "## Cloned Repositories" in context
+        assert "`owner/repo`" in context
+        assert "`/workspace/project/repo/`" in context
+
+    def test_repo_with_ref(self):
+        """Test context generation for repo with ref."""
+        mappings = {
+            "owner/repo": RepoMapping(
+                url="owner/repo",
+                dir_name="repo",
+                local_path="/workspace/project/repo",
+                ref="main",
+            )
+        }
+        context = get_repos_context(mappings)
+        assert "(ref: main)" in context
+
+    def test_multiple_repos(self):
+        """Test context generation for multiple repos."""
+        mappings = {
+            "owner/repo1": RepoMapping(
+                url="owner/repo1",
+                dir_name="repo1",
+                local_path="/workspace/project/repo1",
+                ref=None,
+            ),
+            "owner/repo2": RepoMapping(
+                url="owner/repo2",
+                dir_name="repo2",
+                local_path="/workspace/project/repo2",
+                ref="v1.0",
+            ),
+        }
+        context = get_repos_context(mappings)
+        assert "`owner/repo1`" in context
+        assert "`owner/repo2`" in context
+        assert "(ref: v1.0)" in context
+
+
+class TestCloneRepos:
+    """Tests for clone_repos function."""
+
+    def test_empty_repos_list(self):
+        """Test cloning with empty repos list."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = clone_repos([], Path(tmpdir))
+            assert result.success_count == 0
+            assert result.failed_repos == []
+            assert result.repo_mappings == {}
+
+    @patch("subprocess.run")
+    def test_successful_clone(self, mock_run):
+        """Test successful repo clone."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="owner/repo", provider="github")]
+            result = clone_repos(repos, Path(tmpdir))
+
+            assert result.success_count == 1
+            assert result.failed_repos == []
+            assert "owner/repo" in result.repo_mappings
+            assert result.repo_mappings["owner/repo"].dir_name == "repo"
+
+    @patch("subprocess.run")
+    def test_successful_clone_full_url(self, mock_run):
+        """Test successful clone with full URL (no provider needed)."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="https://github.com/owner/repo")]
+            result = clone_repos(repos, Path(tmpdir))
+
+            assert result.success_count == 1
+            assert "https://github.com/owner/repo" in result.repo_mappings
+
+    @patch("subprocess.run")
+    def test_clone_with_sha_ref(self, mock_run):
+        """Test clone with SHA ref (needs full clone + checkout)."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="owner/repo", ref="abc1234567", provider="github")]
+            clone_repos(repos, Path(tmpdir))
+
+            # Should have been called twice: clone + checkout
+            assert mock_run.call_count == 2
+
+    @patch("subprocess.run")
+    def test_clone_failure(self, mock_run):
+        """Test handling of clone failure."""
+        mock_run.return_value = MagicMock(returncode=1, stderr="Clone failed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="owner/repo", provider="github")]
+            result = clone_repos(repos, Path(tmpdir))
+
+            assert result.success_count == 0
+            assert len(result.failed_repos) == 1
+            assert result.repo_mappings == {}
+
+    @patch("subprocess.run")
+    def test_clone_failure_redacts_credentials_in_stderr(self, mock_run, caplog):
+        """A failing clone must not leak the auth token echoed back in stderr."""
+        token = "ghp_supersecrettoken"
+        # git often echoes the authenticated remote URL back in stderr on failure.
+        leaky_stderr = (
+            f"fatal: Authentication failed for "
+            f"'https://{token}@github.com/owner/repo.git/'"
+        )
+        mock_run.return_value = MagicMock(returncode=1, stderr=leaky_stderr)
+
+        def token_fetcher(name: str) -> str | None:
+            return token if name == "GITHUB_TOKEN" else None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="owner/repo", provider="github")]
+            with caplog.at_level(logging.WARNING):
+                result = clone_repos(repos, Path(tmpdir), token_fetcher=token_fetcher)
+
+        assert result.success_count == 0
+        assert token not in caplog.text
+        assert "[clone] Failed:" in caplog.text
+        assert "https://****@github.com/owner/repo.git" in caplog.text
+
+    @patch("subprocess.run")
+    def test_clone_with_token_fetcher(self, mock_run):
+        """Test clone with token fetcher callback."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        def token_fetcher(name: str) -> str | None:
+            if name == "GITHUB_TOKEN":
+                return "ghtoken123"
+            return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="owner/repo", provider="github")]
+            clone_repos(
+                repos,
+                Path(tmpdir),
+                token_fetcher=token_fetcher,
+            )
+
+            # Check that token was included in clone URL
+            call_args = mock_run.call_args[0][0]
+            assert any("ghtoken123" in str(arg) for arg in call_args)
+
+    @pytest.mark.parametrize(
+        ("provider", "secret_name"),
+        [
+            ("github", "GITHUB_TOKEN"),
+            ("gitlab", "GITLAB_TOKEN"),
+            ("bitbucket", "BITBUCKET_TOKEN"),
+        ],
+    )
+    @patch("subprocess.run")
+    def test_clone_authenticates_with_token_stored_under_env_var_name(
+        self, mock_run, provider, secret_name
+    ):
+        """The provider token is stored under its conventional env var name."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        token = "provider-token-value"
+
+        def token_fetcher(name: str) -> str | None:
+            return token if name == secret_name else None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="owner/repo", provider=provider)]
+            clone_repos(repos, Path(tmpdir), token_fetcher=token_fetcher)
+
+        clone_cmd = mock_run.call_args[0][0]
+        assert any(token in str(arg) for arg in clone_cmd)
+
+    @patch("subprocess.run")
+    def test_clone_falls_back_to_lowercase_token_name(self, mock_run):
+        """App servers that predate the uppercase names serve ``github_token``."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        fetched: list[str] = []
+
+        def token_fetcher(name: str) -> str | None:
+            fetched.append(name)
+            return "legacy-token" if name == "github_token" else None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="owner/repo", provider="github")]
+            clone_repos(repos, Path(tmpdir), token_fetcher=token_fetcher)
+
+        clone_cmd = mock_run.call_args[0][0]
+        assert any("legacy-token" in str(arg) for arg in clone_cmd)
+        assert fetched == ["GITHUB_TOKEN", "github_token"]
+
+    @patch("subprocess.run")
+    def test_clone_prefers_uppercase_token_name(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        tokens = {"GITHUB_TOKEN": "current-token", "github_token": "legacy-token"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="owner/repo", provider="github")]
+            clone_repos(repos, Path(tmpdir), token_fetcher=tokens.get)
+
+        clone_cmd = " ".join(str(arg) for arg in mock_run.call_args[0][0])
+        assert "current-token" in clone_cmd
+        assert "legacy-token" not in clone_cmd
+
+    @patch("subprocess.run")
+    def test_clone_with_provider_specific_token(self, mock_run):
+        """Test clone fetches correct token based on provider."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        fetched_tokens = []
+
+        def token_fetcher(name: str) -> str | None:
+            fetched_tokens.append(name)
+            return f"token_for_{name}"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [
+                RepoSource(url="owner/repo1", provider="github"),
+                RepoSource(url="owner/repo2", provider="gitlab"),
+            ]
+            clone_repos(repos, Path(tmpdir), token_fetcher=token_fetcher)
+
+            # Should have fetched GITHUB_TOKEN and GITLAB_TOKEN
+            assert "GITHUB_TOKEN" in fetched_tokens
+            assert "GITLAB_TOKEN" in fetched_tokens
+
+    @patch("subprocess.run")
+    def test_clone_self_hosted_gitlab_with_token(self, mock_run):
+        """A self-hosted GitLab instance clones with the token authenticated,
+        instead of silently sending an unauthenticated request."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        def token_fetcher(name: str) -> str | None:
+            return "gltoken123" if name == "GITLAB_TOKEN" else None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [
+                RepoSource(
+                    url="https://gitlab.mycompany.com/owner/repo",
+                    provider="gitlab",
+                )
+            ]
+            clone_repos(repos, Path(tmpdir), token_fetcher=token_fetcher)
+
+            call_args = mock_run.call_args[0][0]
+            assert any(
+                "oauth2:gltoken123@gitlab.mycompany.com" in str(arg)
+                for arg in call_args
+            )
+
+    @patch("subprocess.run")
+    def test_clone_azure_devops_with_token(self, mock_run):
+        """An Azure DevOps repository clones with the azure_devops_token."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        def token_fetcher(name: str) -> str | None:
+            return "adotoken" if name == "azure_devops_token" else None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="https://dev.azure.com/org/project/_git/repo")]
+            result = clone_repos(repos, Path(tmpdir), token_fetcher=token_fetcher)
+
+            assert result.success_count == 1
+            assert result.repo_mappings[repos[0].url].dir_name == "repo"
+            call_args = mock_run.call_args[0][0]
+            assert any(
+                "oauth2:adotoken@dev.azure.com/org/project/_git/repo" in str(arg)
+                for arg in call_args
+            )
+
+    @patch("subprocess.run")
+    def test_clone_bitbucket_dc_with_dc_token_only(self, mock_run):
+        """A Data Center repo clones with its own token as a Bearer header and
+        never receives the Bitbucket Cloud token."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        tokens = {"bitbucket_token": "cloudtoken", "bitbucket_data_center_token": "dct"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [
+                RepoSource(
+                    url="https://bb.example.com/projects/DEM/repos/demo-app/browse",
+                    provider="bitbucket_data_center",
+                )
+            ]
+            result = clone_repos(repos, Path(tmpdir), token_fetcher=tokens.get)
+
+            assert result.success_count == 1
+            assert result.repo_mappings[repos[0].url].dir_name == "demo-app"
+            args, kwargs = mock_run.call_args
+            assert "https://bb.example.com/scm/DEM/demo-app.git" in args[0]
+            assert not any("dct" in str(arg) for arg in args[0])
+            env = kwargs["env"]
+            assert "Authorization: Bearer dct" in env.values()
+            assert not any("cloudtoken" in value for value in env.values())
+
+    @patch("subprocess.run")
+    def test_clone_bitbucket_dc_labelled_bitbucket_gets_no_token(self, mock_run):
+        """Labelling a Data Center repo `bitbucket` does not leak the Cloud token."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [
+                RepoSource(
+                    url="https://bb.example.com/scm/DEM/demo-app.git",
+                    provider="bitbucket",
+                )
+            ]
+            clone_repos(repos, Path(tmpdir), token_fetcher=lambda _: "cloudtoken")
+
+            args, kwargs = mock_run.call_args
+            assert not any("cloudtoken" in str(arg) for arg in args[0])
+            assert kwargs["env"] is None
+
+    @patch("subprocess.run")
+    def test_directory_name_collision(self, mock_run):
+        """Test handling of directory name collisions."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Two repos with same name should get unique directories
+            repos = [
+                RepoSource(url="owner1/utils", provider="github"),
+                RepoSource(url="owner2/utils", provider="github"),
+            ]
+            result = clone_repos(repos, Path(tmpdir))
+
+            dir_names = [m.dir_name for m in result.repo_mappings.values()]
+            assert "utils" in dir_names
+            assert "utils_1" in dir_names
+
+
+class TestCloudWorkspaceRepoMethods:
+    """Tests for OpenHandsCloudWorkspace repo methods."""
+
+    @patch("openhands.sdk.workspace.remote.base._clone_repos_helper")
+    @patch.object(
+        __import__(
+            "openhands.workspace.cloud.workspace", fromlist=["OpenHandsCloudWorkspace"]
+        ).OpenHandsCloudWorkspace,
+        "_get_secret_value",
+        return_value=None,
+    )
+    def test_clone_repos_full_url_list(self, mock_secret, mock_clone):
+        """Test clone_repos with list of full URL strings."""
+        from openhands.workspace import OpenHandsCloudWorkspace
+
+        mock_clone.return_value = CloneResult(0, [], {})
+
+        with patch.object(
+            OpenHandsCloudWorkspace, "model_post_init", lambda self, ctx: None
+        ):
+            workspace = OpenHandsCloudWorkspace(
+                cloud_api_url="https://test.com",
+                cloud_api_key="test-key",
+                local_agent_server_mode=True,
+            )
+            workspace._sandbox_id = "test-sandbox"
+            workspace._session_api_key = "test-session"
+            workspace.working_dir = "/workspace/project"
+
+            # Full URLs don't need provider
+            workspace.clone_repos(
+                [
+                    "https://github.com/owner/repo1",
+                    "https://github.com/owner/repo2",
+                ]
+            )
+
+            mock_clone.assert_called_once()
+            call_args = mock_clone.call_args
+            repos = call_args.kwargs["repos"]
+            assert len(repos) == 2
+            assert all(isinstance(r, RepoSource) for r in repos)
+
+    @patch("openhands.sdk.workspace.remote.base._clone_repos_helper")
+    @patch.object(
+        __import__(
+            "openhands.workspace.cloud.workspace", fromlist=["OpenHandsCloudWorkspace"]
+        ).OpenHandsCloudWorkspace,
+        "_get_secret_value",
+        return_value=None,
+    )
+    def test_clone_repos_dict_list(self, mock_secret, mock_clone):
+        """Test clone_repos with list of dicts."""
+        from openhands.workspace import OpenHandsCloudWorkspace
+
+        mock_clone.return_value = CloneResult(0, [], {})
+
+        with patch.object(
+            OpenHandsCloudWorkspace, "model_post_init", lambda self, ctx: None
+        ):
+            workspace = OpenHandsCloudWorkspace(
+                cloud_api_url="https://test.com",
+                cloud_api_key="test-key",
+                local_agent_server_mode=True,
+            )
+            workspace._sandbox_id = "test-sandbox"
+            workspace._session_api_key = "test-session"
+            workspace.working_dir = "/workspace/project"
+
+            # Short URL with provider specified
+            workspace.clone_repos(
+                [{"url": "owner/repo", "ref": "main", "provider": "github"}]
+            )
+
+            mock_clone.assert_called_once()
+            call_args = mock_clone.call_args
+            repos = call_args.kwargs["repos"]
+            assert len(repos) == 1
+            assert repos[0].url == "owner/repo"
+            assert repos[0].ref == "main"
+            assert repos[0].provider == "github"
+
+    def test_get_repos_context_from_mappings(self):
+        """Test get_repos_context with explicit mappings."""
+        from openhands.workspace import OpenHandsCloudWorkspace
+
+        with patch.object(
+            OpenHandsCloudWorkspace, "model_post_init", lambda self, ctx: None
+        ):
+            workspace = OpenHandsCloudWorkspace(
+                cloud_api_url="https://test.com",
+                cloud_api_key="test-key",
+                local_agent_server_mode=True,
+            )
+            workspace.working_dir = "/workspace/project"
+
+            mappings = {
+                "owner/repo": RepoMapping(
+                    url="owner/repo",
+                    dir_name="repo",
+                    local_path="/workspace/project/repo",
+                    ref="main",
+                )
+            }
+
+            context = workspace.get_repos_context(mappings)
+            assert "## Cloned Repositories" in context
+            assert "`owner/repo`" in context
+
+    def test_load_skills_from_agent_server_preserves_base_context(self):
+        """OpenHandsCloudWorkspace override must forward base_context through
+        to RemoteWorkspace so caller-configured AgentContext fields survive."""
+        from openhands.sdk.context import AgentContext
+        from openhands.workspace import OpenHandsCloudWorkspace
+
+        with patch.object(
+            OpenHandsCloudWorkspace, "model_post_init", lambda self, ctx: None
+        ):
+            workspace = OpenHandsCloudWorkspace(
+                cloud_api_url="https://test.com",
+                cloud_api_key="test-key",
+                local_agent_server_mode=True,
+            )
+            workspace._sandbox_id = "test-sandbox"
+            workspace._session_api_key = "test-session"
+            workspace.working_dir = "/workspace/project"
+            workspace.host = "http://localhost:8000"
+
+            base_context = AgentContext(
+                marketplace_path="internal/marketplace.json",
+                disabled_skills=["risky-skill"],
+            )
+
+            with patch.object(
+                workspace,
+                "_call_skills_api",
+                return_value=[{"name": "test-skill", "content": "Test content"}],
+            ):
+                skills, context = workspace.load_skills_from_agent_server(
+                    base_context=base_context
+                )
+
+            assert len(skills) == 1
+            assert context.marketplace_path == "internal/marketplace.json"
+            assert context.disabled_skills == ["risky-skill"]
+            assert context.load_public_skills is False
+
+
+class TestCloneReposIntegration:
+    """Integration tests for clone_repos using real git operations.
+
+    These tests exercise actual git cloning behavior rather than mocking subprocess.
+    Uses a small local git repository as a fixture to avoid network dependencies.
+    """
+
+    @pytest.fixture
+    def local_git_repo(self, tmp_path):
+        """Create a minimal local git repo for testing."""
+        import subprocess
+
+        repo_dir = tmp_path / "test_repo"
+        repo_dir.mkdir()
+
+        # Initialize git repo
+        subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=repo_dir,
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=repo_dir,
+            capture_output=True,
+            check=True,
+        )
+
+        # Create a file and commit
+        (repo_dir / "README.md").write_text("# Test Repo")
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=repo_dir, capture_output=True, check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "Initial commit"],
+            cwd=repo_dir,
+            capture_output=True,
+            check=True,
+        )
+
+        # Create a tag
+        subprocess.run(
+            ["git", "tag", "v1.0.0"], cwd=repo_dir, capture_output=True, check=True
+        )
+
+        # Get the commit SHA
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        commit_sha = result.stdout.strip()
+
+        return {"path": repo_dir, "sha": commit_sha}
+
+    def test_clone_local_repo(self, local_git_repo, tmp_path):
+        """Test cloning a local git repository."""
+        target_dir = tmp_path / "cloned"
+        repo_url = f"file://{local_git_repo['path']}"
+
+        repos = [RepoSource(url=repo_url)]
+        result = clone_repos(repos, target_dir)
+
+        assert result.success_count == 1
+        assert len(result.failed_repos) == 0
+        assert repo_url in result.repo_mappings
+
+        # Verify the repo was actually cloned
+        cloned_path = Path(result.repo_mappings[repo_url].local_path)
+        assert cloned_path.exists()
+        assert (cloned_path / "README.md").exists()
+        assert (cloned_path / "README.md").read_text() == "# Test Repo"
+
+    def test_clone_with_tag_ref(self, local_git_repo, tmp_path):
+        """Test cloning with a specific tag ref."""
+        import subprocess
+
+        target_dir = tmp_path / "cloned"
+        repo_url = f"file://{local_git_repo['path']}"
+
+        repos = [RepoSource(url=repo_url, ref="v1.0.0")]
+        result = clone_repos(repos, target_dir)
+
+        assert result.success_count == 1
+        cloned_path = Path(result.repo_mappings[repo_url].local_path)
+        assert cloned_path.exists()
+
+        # Verify the tag was actually checked out
+        tag_result = subprocess.run(
+            ["git", "-C", str(cloned_path), "describe", "--tags", "--exact-match"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert tag_result.stdout.strip() == "v1.0.0"
+
+    def test_clone_with_sha_ref(self, local_git_repo, tmp_path):
+        """Test cloning with a specific commit SHA."""
+        import subprocess
+
+        target_dir = tmp_path / "cloned"
+        repo_url = f"file://{local_git_repo['path']}"
+        sha = local_git_repo["sha"]
+
+        repos = [RepoSource(url=repo_url, ref=sha)]
+        result = clone_repos(repos, target_dir)
+
+        assert result.success_count == 1
+        cloned_path = Path(result.repo_mappings[repo_url].local_path)
+        assert cloned_path.exists()
+
+        # Verify the SHA was actually checked out
+        sha_result = subprocess.run(
+            ["git", "-C", str(cloned_path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert sha_result.stdout.strip() == sha
+
+    def test_clone_invalid_url_fails(self, tmp_path):
+        """Test that invalid URLs are handled gracefully."""
+        target_dir = tmp_path / "cloned"
+
+        repos = [RepoSource(url="file:///nonexistent/repo")]
+        result = clone_repos(repos, target_dir)
+
+        assert result.success_count == 0
+        assert len(result.failed_repos) == 1
+
+    def test_clone_duplicate_urls_deduplicated(self, local_git_repo, tmp_path):
+        """Test that duplicate URLs are deduplicated."""
+        target_dir = tmp_path / "cloned"
+        repo_url = f"file://{local_git_repo['path']}"
+
+        # Same URL twice
+        repos = [RepoSource(url=repo_url), RepoSource(url=repo_url)]
+        result = clone_repos(repos, target_dir)
+
+        # Should only clone once
+        assert result.success_count == 1
+        assert len(result.repo_mappings) == 1

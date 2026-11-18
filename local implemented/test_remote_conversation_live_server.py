@@ -1,0 +1,3890 @@
+"""End-to-end test using a real FastAPI agent server with patched LLM.
+
+This validates RemoteConversation against actual REST + WebSocket endpoints,
+while keeping the LLM deterministic via monkeypatching.
+"""
+
+import asyncio
+import io
+import json
+import os
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import zipfile
+from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from typing import cast
+from uuid import UUID, uuid4
+
+import httpx
+import pytest
+from fastapi import WebSocket
+from filelock import FileLock
+from litellm.types.utils import Choices, Message as LiteLLMMessage, ModelResponse
+from openai.types.responses import ResponseInputItemParam
+from pydantic import SecretStr
+from websockets.exceptions import ConnectionClosed, InvalidStatus
+from websockets.sync.client import connect
+
+from openhands.agent_server.config import Config, load_config
+from openhands.agent_server.session_protocol import MAX_FRAME_BYTES
+from openhands.sdk import LLM, Agent, AgentContext, Conversation, Message, TextContent
+from openhands.sdk.conversation import RemoteConversation
+from openhands.sdk.conversation.conversation_stats import ConversationStats
+from openhands.sdk.conversation.event_store import EventLog
+from openhands.sdk.conversation.exceptions import WebSocketConnectionError
+from openhands.sdk.event import (
+    ActionEvent,
+    AgentErrorEvent,
+    CondensationSummaryEvent,
+    ConversationStateUpdateEvent,
+    Event,
+    HookExecutionEvent,
+    LLMConvertibleEvent,
+    MessageEvent,
+    ObservationEvent,
+    PauseEvent,
+    SecurityAnalysisEvent,
+    SystemPromptEvent,
+)
+from openhands.sdk.event.ask_user import find_pending_ask
+from openhands.sdk.event.error_classification import ErrorClassification, FailureKind
+from openhands.sdk.git.exceptions import GitCommandError
+from openhands.sdk.git.utils import run_git_command
+from openhands.sdk.hooks import HookConfig, HookDefinition, HookMatcher
+from openhands.sdk.io.local import LocalFileStore
+from openhands.sdk.llm import MessageToolCall
+from openhands.sdk.llm.utils.metrics import Metrics
+from openhands.sdk.security.llm_analyzer import LLMSecurityAnalyzer
+from openhands.sdk.skills import Skill
+from openhands.sdk.subagent import AgentDefinition
+from openhands.sdk.subagent.registry import (
+    _reset_registry_for_tests,
+    get_factory_info,
+    get_registered_agent_definitions,
+    register_agent,
+    register_agent_if_absent,
+)
+from openhands.sdk.testing import TestLLM
+from openhands.sdk.tool import Tool
+from openhands.sdk.utils.cipher import Cipher
+from openhands.sdk.utils.pydantic_secrets import REDACTED_SECRET_VALUE
+from openhands.sdk.workspace import RemoteWorkspace
+from openhands.tools.ask_user import AskUserTool
+from openhands.tools.file_editor import FileEditorTool
+from tests.command_utils import python_command
+from tests.cross.conftest import live_server_env
+from tests.tools.ask_user.test_ask_user import QUESTION
+
+
+def _assert_secret(value: "str | SecretStr", expected: str) -> None:
+    """Assert a SecretStr-or-str api_key matches the expected plaintext."""
+    if isinstance(value, SecretStr):
+        assert value.get_secret_value() == expected
+    else:
+        assert value == expected
+
+
+@pytest.mark.parametrize("context_mib", [2, 17])
+def test_attach_receives_large_initial_state(tmp_path: Path, monkeypatch, context_mib):
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "5")
+    # Skill bodies are left out of the snapshot, so grow a field that is sent.
+    agent = Agent(
+        llm=LLM(model="gpt-4o-mini", api_key=SecretStr("test")),
+        tools=[],
+        agent_context=AgentContext(
+            system_message_suffix="x" * (context_mib * 1024 * 1024)
+        ),
+    )
+    received = []
+    message_received = threading.Event()
+
+    def on_event(event):
+        received.append(event)
+        if isinstance(event, MessageEvent) and event.source == "user":
+            message_received.set()
+
+    with live_server_env(tmp_path, monkeypatch) as environment:
+        workspace = RemoteWorkspace(
+            host=environment["host"], working_dir=str(tmp_path / "workspace")
+        )
+        response = workspace.client.post(
+            "/api/conversations",
+            json={
+                "agent": agent.model_dump(
+                    mode="json", context={"expose_secrets": True}
+                ),
+                "workspace": {"working_dir": workspace.working_dir},
+            },
+        )
+        response.raise_for_status()
+        conversation_id = UUID(response.json()["id"])
+        try:
+            if context_mib == 17:
+                with pytest.raises(
+                    WebSocketConnectionError, match="message too big.*1009"
+                ):
+                    RemoteConversation.attach(
+                        workspace, conversation_id, visualizer=None
+                    )
+                return
+            conversation = RemoteConversation.attach(
+                workspace, conversation_id, callbacks=[on_event], visualizer=None
+            )
+            try:
+                snapshots = [
+                    event
+                    for event in received
+                    if isinstance(event, ConversationStateUpdateEvent)
+                ]
+                assert any(
+                    len(event.model_dump_json()) > 1024 * 1024 for event in snapshots
+                )
+                conversation.send_message("Verify event delivery after attaching.")
+                assert message_received.wait(5)
+            finally:
+                conversation.close()
+        finally:
+            workspace.client.delete(f"/api/conversations/{conversation_id}")
+            workspace.client.close()
+
+
+def test_deferred_websocket_initialization_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    async def accept_app_backend_websocket(
+        websocket: WebSocket, _extension_name: str, _path: str, _config: Config
+    ) -> None:
+        await websocket.accept()
+        await websocket.close()
+
+    monkeypatch.setattr(
+        "openhands.agent_server.canvas_extensions_bridge_router."
+        "proxy_app_backend_websocket",
+        accept_app_backend_websocket,
+    )
+
+    with live_server_env(tmp_path, monkeypatch, deferred_init=True) as environment:
+        host = environment["host"]
+        websocket_origin = host.replace("http://", "ws://")
+        bash_socket_url = f"{websocket_origin}/sockets/bash-events"
+        app_backend_socket_urls = (
+            f"{websocket_origin}/app-backends/test-extension",
+            f"{websocket_origin}/app-backends/test-extension/events",
+        )
+
+        with httpx.Client(base_url=host, trust_env=False) as client:
+            assert client.get("/api/init").json()["state"] == "dormant"
+            assert client.get("/api/conversations/count").status_code == 503
+
+            for socket_url in (*app_backend_socket_urls, bash_socket_url):
+                with pytest.raises(InvalidStatus) as rejected:
+                    with connect(socket_url):
+                        pytest.fail(f"Dormant WebSocket accepted: {socket_url}")
+                assert rejected.value.response.status_code == 403
+
+            initialized = client.post(
+                "/api/init",
+                headers={"X-Init-API-Key": "test-bootstrap-key"},
+                json={"session_api_keys": ["test-ready-key"]},
+            )
+            assert initialized.status_code == 200
+            assert initialized.json()["state"] == "ready"
+            assert client.get("/api/conversations/count").status_code == 401
+            assert (
+                client.get(
+                    "/api/conversations/count",
+                    headers={"X-Session-API-Key": "test-ready-key"},
+                ).status_code
+                == 200
+            )
+
+            for socket_url in app_backend_socket_urls:
+                with connect(socket_url):
+                    pass
+
+            with connect(bash_socket_url) as websocket:
+                websocket.send(json.dumps({"type": "auth", "session_api_key": "wrong"}))
+                with pytest.raises(ConnectionClosed) as unauthorized:
+                    websocket.recv(timeout=5)
+                assert unauthorized.value.rcvd is not None
+                assert unauthorized.value.rcvd.code == 4001
+
+            with connect(bash_socket_url) as websocket:
+                websocket.send(
+                    json.dumps({"type": "auth", "session_api_key": "test-ready-key"})
+                )
+                websocket.send(
+                    json.dumps({"command": "printf websocket-ready", "timeout": 5})
+                )
+                output = ""
+                while True:
+                    event = json.loads(websocket.recv(timeout=10))
+                    if event["kind"] == "BashOutput":
+                        output += event.get("stdout") or ""
+                        if event["exit_code"] is not None:
+                            assert event["exit_code"] == 0
+                            break
+                assert output == "websocket-ready"
+
+
+@pytest.mark.parametrize(
+    ("stored_key", "previous_keys"),
+    [
+        ("test-old-key", ["test-old-key"]),
+        ("test-current-key", []),
+    ],
+    ids=["rotated-key", "current-key"],
+)
+def test_deferred_init_refreshes_persistence_ciphers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stored_key: str,
+    previous_keys: list[str],
+):
+    with live_server_env(
+        tmp_path, monkeypatch, config_overrides={"secret_key": stored_key}
+    ) as environment:
+        with httpx.Client(base_url=environment["host"], trust_env=False) as client:
+            assert (
+                client.patch(
+                    "/api/settings",
+                    json={"agent_settings_diff": {"llm": {"api_key": "sk-test-saved"}}},
+                ).status_code
+                == 200
+            )
+            assert (
+                client.put(
+                    "/api/settings/secrets",
+                    json={"name": "QA_TOKEN", "value": "test-saved-secret"},
+                ).status_code
+                == 200
+            )
+
+    with live_server_env(
+        tmp_path,
+        monkeypatch,
+        deferred_init=True,
+        config_overrides={
+            "telemetry": {
+                "exporter": "http",
+                "http_endpoint": "http://127.0.0.1:9",
+            },
+        },
+    ) as environment:
+        with httpx.Client(base_url=environment["host"], trust_env=False) as client:
+            response = client.post(
+                "/api/init",
+                headers={"X-Init-API-Key": "test-bootstrap-key"},
+                json={
+                    "secret_key": "test-current-key",
+                    "previous_secret_keys": previous_keys,
+                },
+            )
+            assert response.status_code == 200
+            settings = client.get(
+                "/api/settings", headers={"X-Expose-Secrets": "plaintext"}
+            ).json()
+            assert settings["llm_api_key_is_set"] is True
+            assert settings["agent_settings"]["llm"]["api_key"] == "sk-test-saved"
+            assert client.get("/api/settings/secrets/QA_TOKEN").text == (
+                "test-saved-secret"
+            )
+
+            persistence_dir = tmp_path / ".openhands"
+            cipher = Cipher("test-current-key")
+            saved_settings = json.loads((persistence_dir / "settings.json").read_text())
+            saved_secrets = json.loads((persistence_dir / "secrets.json").read_text())
+            assert (
+                cipher.try_decrypt_str(
+                    saved_settings["agent_settings"]["llm"]["api_key"]
+                )
+                == "sk-test-saved"
+            )
+            assert (
+                cipher.try_decrypt_str(
+                    saved_secrets["custom_secrets"]["QA_TOKEN"]["secret"]
+                )
+                == "test-saved-secret"
+            )
+
+            assert (
+                client.patch(
+                    "/api/settings", json={"misc_settings_diff": {"qa_note": True}}
+                ).status_code
+                == 200
+            )
+            assert (
+                client.put(
+                    "/api/settings/secrets", json={"name": "QA_OTHER", "value": "x"}
+                ).status_code
+                == 200
+            )
+
+
+def test_health_endpoints_return_ok_json(server_env):
+    with httpx.Client() as client:
+        for endpoint in ("/alive", "/health"):
+            response = client.get(f"{server_env['host']}{endpoint}", timeout=1.0)
+            assert response.status_code == 200
+            assert response.json() == {"status": "ok"}
+
+
+def test_pending_question_blocks_goal_resume_over_http(
+    server_env, monkeypatch, tmp_path
+):
+    scripted_agent = TestLLM.from_messages(
+        [
+            Message(
+                role="assistant",
+                tool_calls=[
+                    MessageToolCall(
+                        id="ask",
+                        name="ask_user",
+                        arguments=json.dumps(QUESTION),
+                        origin="completion",
+                    )
+                ],
+            ),
+            Message(role="assistant", content=[TextContent(text="Shipped")]),
+            Message(role="assistant", content=[TextContent(text="Checked")]),
+        ]
+    )
+
+    def complete(self, messages, tools=None, **kwargs):
+        if tools:
+            return scripted_agent.completion(messages, tools, **kwargs)
+        return TestLLM.from_messages(
+            [
+                Message(
+                    role="assistant",
+                    content=[
+                        TextContent(text='{"score":1,"complete":true,"missing":""}')
+                    ],
+                )
+            ]
+        ).completion(messages, **kwargs)
+
+    async def acomplete(self, messages, tools=None, **kwargs):
+        return complete(self, messages, tools, **kwargs)
+
+    monkeypatch.setattr(LLM, "completion", complete)
+    monkeypatch.setattr(LLM, "acompletion", acomplete)
+    interrupted = threading.Event()
+    completed = threading.Event()
+
+    def on_event(event):
+        if isinstance(event, ConversationStateUpdateEvent) and event.key == "goal":
+            if event.value["status"] == "interrupted":
+                interrupted.set()
+            if event.value["status"] == "complete":
+                completed.set()
+
+    marker = tmp_path / "stop-ran"
+    command = python_command(
+        "from pathlib import Path; import sys; "
+        f"marker = Path({str(marker)!r}); existed = marker.exists(); "
+        "marker.touch(); print('Keep working', file=sys.stderr); "
+        "sys.exit(0 if existed else 2)"
+    )
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir=str(server_env["workspace_path"])
+    )
+    conversation = Conversation(
+        agent=Agent(
+            llm=LLM(model="gpt-4o-mini", api_key=SecretStr("test")),
+            tools=[Tool(name=AskUserTool.name)],
+        ),
+        workspace=workspace,
+        callbacks=[on_event],
+        visualizer=None,
+        hook_config=HookConfig(
+            stop=[HookMatcher(hooks=[HookDefinition(command=command)])]
+        ),
+    )
+    try:
+        path = f"/api/conversations/{conversation.id}/goal"
+        with httpx.Client(base_url=server_env["host"], timeout=15) as client:
+            client.post(path, json={"objective": "Ship the fix"}).raise_for_status()
+            assert interrupted.wait(15)
+            assert find_pending_ask(conversation.state.events) is not None
+            assert not marker.exists()
+            response = client.post(f"{path}/resume")
+            assert response.status_code == 400
+            assert "pending_ask" in response.text
+            conversation.send_message("Use the flag")
+            client.post(f"{path}/resume").raise_for_status()
+            assert completed.wait(15)
+            assert find_pending_ask(conversation.state.events) is None
+            assert marker.exists()
+    finally:
+        conversation.close()
+
+
+def test_recovery_provenance_served_over_http_and_websocket(server_env):
+    recovery = AgentErrorEvent(
+        error="Interrupted execution",
+        tool_name="terminal",
+        tool_call_id="interrupted_call",
+        recovery_reason="server_restart",
+        classification=ErrorClassification(kind=FailureKind.INTERNAL, retryable=False),
+    )
+    received: list[Event] = []
+    delivered = threading.Event()
+
+    def on_event(event: Event) -> None:
+        if event.id == recovery.id:
+            received.append(event)
+            delivered.set()
+
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir=str(server_env["workspace_path"])
+    )
+    agent = Agent(llm=LLM(model="gpt-4o-mini", api_key=SecretStr("test")), tools=[])
+    conversation: RemoteConversation = Conversation(
+        agent=agent, workspace=workspace, callbacks=[on_event], visualizer=None
+    )
+    try:
+        event_service = server_env["conversation_service"]._event_services[
+            conversation.id
+        ]
+        event_service.get_conversation()._on_event(recovery)
+        assert delivered.wait(5)
+        websocket_event = received[0]
+        assert isinstance(websocket_event, AgentErrorEvent)
+        assert websocket_event.recovery_reason == "server_restart"
+
+        event_path = f"/api/conversations/{conversation.id}/events"
+        with httpx.Client(base_url=server_env["host"]) as client:
+            single = client.get(f"{event_path}/{recovery.id}")
+            single.raise_for_status()
+            search = client.get(
+                f"{event_path}/search", params={"kind": "AgentErrorEvent"}
+            )
+            search.raise_for_status()
+
+        assert single.json()["recovery_reason"] == "server_restart"
+        assert [Event.model_validate(item) for item in search.json()["items"]] == [
+            websocket_event
+        ]
+        assert Event.model_validate(single.json()) == websocket_event
+    finally:
+        conversation.close()
+
+
+def test_trajectory_downloads_are_independent(tmp_path, monkeypatch):
+    with live_server_env(tmp_path, monkeypatch) as server_env:
+        agent = Agent(
+            llm=LLM(model="gpt-4o-mini", api_key=SecretStr("test")),
+            tools=[],
+        )
+        payload = {
+            "agent": agent.model_dump(mode="json", context={"expose_secrets": True}),
+            "workspace": {"working_dir": str(server_env["workspace_path"])},
+        }
+        with httpx.Client(base_url=server_env["host"]) as client:
+            start = client.post("/api/conversations", json=payload, timeout=10.0)
+            start.raise_for_status()
+            conversation_id = UUID(start.json()["id"])
+            download_path = f"/api/file/download-trajectory/{conversation_id}"
+            downloads = [client.get(download_path) for _ in range(5)]
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                downloads.extend(
+                    pool.map(lambda _: client.get(download_path), range(24))
+                )
+            for download in downloads:
+                download.raise_for_status()
+                with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
+                    assert archive.testzip() is None
+                    assert (
+                        f"{conversation_id.hex}/base_state.json" in archive.namelist()
+                    )
+            assert not list(
+                (server_env["workspace_path"].parent / "conversations").glob("*.zip*")
+            )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="tmux requires Unix sockets")
+def test_live_server_does_not_use_inherited_tmux_namespace(tmp_path, monkeypatch):
+    with tempfile.TemporaryDirectory(prefix="oh-host-tmux-", dir="/tmp") as shared:
+        monkeypatch.setenv("TMUX_TMPDIR", shared)
+        with live_server_env(tmp_path, monkeypatch):
+            socket_root = os.environ.get("TMUX_TMPDIR")
+            assert socket_root != shared
+            assert socket_root is not None and Path(socket_root).is_dir()
+
+
+def test_live_server_does_not_use_inherited_session_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("OH_SESSION_API_KEYS_0", "host-session-key")
+    with live_server_env(tmp_path, monkeypatch):
+        assert "OH_SESSION_API_KEYS_0" not in os.environ
+
+
+def test_live_server_uses_configured_conversations_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("OH_CONVERSATIONS_PATH", str(tmp_path / "host-conversations"))
+    with live_server_env(tmp_path, monkeypatch):
+        assert load_config().conversations_path == tmp_path / "conversations"
+
+
+def test_prepare_for_sandbox_pause_drains_conversations(server_env):
+    agent = Agent(
+        llm=LLM(model="gpt-4o-mini", api_key=SecretStr("test")),
+        tools=[],
+    )
+    payload = {
+        "agent": agent.model_dump(mode="json", context={"expose_secrets": True}),
+        "workspace": {"working_dir": "/tmp/workspace/project"},
+    }
+    with httpx.Client(base_url=server_env["host"]) as client:
+        start = client.post("/api/conversations", json=payload, timeout=10.0)
+        start.raise_for_status()
+        conversation_id = UUID(start.json()["id"])
+        assert conversation_id in server_env["conversation_service"]._event_services
+
+        response = client.post(
+            "/api/conversations/prepare-for-sandbox-pause",
+            timeout=10.0,
+        )
+
+    assert response.status_code == 204
+    assert conversation_id not in server_env["conversation_service"]._event_services
+    assert conversation_id in server_env["conversation_service"]._conversation_records
+
+
+def _start_idle_conversation(client: httpx.Client) -> str:
+    agent = Agent(llm=LLM(model="gpt-4o-mini", api_key=SecretStr("test")), tools=[])
+    payload = {
+        "agent": agent.model_dump(mode="json", context={"expose_secrets": True}),
+        "workspace": {"working_dir": "/tmp/workspace/project"},
+    }
+    start = client.post("/api/conversations", json=payload, timeout=10.0)
+    start.raise_for_status()
+    return start.json()["id"]
+
+
+def _assert_closed_by_server(websocket) -> int:
+    """Read until the server's close frame; fail if the socket stays open."""
+    with pytest.raises(ConnectionClosed) as closed:
+        while True:
+            websocket.recv(timeout=10)
+    assert closed.value.rcvd is not None, "socket closed without a server frame"
+    return closed.value.rcvd.code
+
+
+@pytest.mark.parametrize("socket_kind", ["events", "session"])
+def test_delete_closes_open_conversation_sockets(server_env, socket_kind):
+    """Deleting a conversation closes the sockets attached to it (#5635)."""
+    ws_host = server_env["host"].replace("http://", "ws://")
+    with httpx.Client(base_url=server_env["host"]) as client:
+        conversation_id = _start_idle_conversation(client)
+        with connect(f"{ws_host}/sockets/{socket_kind}/{conversation_id}") as ws:
+            ws.recv(timeout=10)  # subscribed: snapshot (events) or sync (session)
+
+            response = client.delete(f"/api/conversations/{conversation_id}")
+            assert response.status_code == 200
+
+            code = _assert_closed_by_server(ws)
+        assert client.get(f"/api/conversations/{conversation_id}").status_code == 404
+
+    assert code == 4004  # final for clients: no reconnect
+    with connect(f"{ws_host}/sockets/{socket_kind}/{conversation_id}") as ws:
+        assert _assert_closed_by_server(ws) == 4004
+
+
+@pytest.mark.parametrize("socket_kind", ["events", "session"])
+def test_sandbox_pause_leaves_open_sockets_attached(server_env, socket_kind):
+    """A pause does not close sockets: today's clients reconnect on any close,
+    and the reconnect would load the conversation again before the freeze."""
+    ws_host = server_env["host"].replace("http://", "ws://")
+    service = server_env["conversation_service"]
+    with httpx.Client(base_url=server_env["host"]) as client:
+        conversation_id = _start_idle_conversation(client)
+        with connect(f"{ws_host}/sockets/{socket_kind}/{conversation_id}") as before:
+            before.recv(timeout=10)
+
+            response = client.post(
+                "/api/conversations/prepare-for-sandbox-pause", timeout=10.0
+            )
+            assert response.status_code == 204
+
+            # Leftover initial frames may still arrive; a close would raise.
+            with pytest.raises(TimeoutError):
+                while True:
+                    before.recv(timeout=2)
+            assert UUID(conversation_id) not in service._event_services
+
+
+@pytest.fixture
+def server_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[dict]:
+    with live_server_env(tmp_path, monkeypatch) as env:
+        yield env
+
+
+@pytest.fixture
+def authenticated_server_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[dict]:
+    api_key = "test-websocket-auth-key"
+    with live_server_env(
+        tmp_path,
+        monkeypatch,
+        session_api_keys=[api_key],
+    ) as env:
+        env["api_key"] = api_key
+        yield env
+
+
+@pytest.fixture
+def patched_llm(monkeypatch: pytest.MonkeyPatch) -> list[list[Message]]:
+    """Patch LLM.completion to a deterministic assistant message response."""
+
+    calls: list[list[Message]] = []
+
+    def fake_completion(
+        self,
+        messages,
+        tools,
+        add_security_risk_prediction=False,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        from openhands.sdk.llm.llm_response import LLMResponse
+
+        calls.append(messages)
+
+        # Create a minimal ModelResponse with a single assistant message
+        litellm_msg = LiteLLMMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "Hello from patched LLM",
+            }
+        )
+        raw_response = ModelResponse(
+            id="test-resp",
+            created=int(time.time()),
+            model="test-model",
+            choices=[Choices(index=0, finish_reason="stop", message=litellm_msg)],
+        )
+
+        # Convert to OpenHands Message
+        message = Message.from_llm_chat_message(litellm_msg)
+
+        self.metrics.add_token_usage(
+            prompt_tokens=7,
+            completion_tokens=5,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+            context_window=8192,
+            response_id="test-resp",
+            reasoning_tokens=0,
+        )
+
+        # Return LLMResponse as expected by the agent
+        return LLMResponse(
+            message=message,
+            metrics=self.metrics.get_snapshot(),
+            raw_response=raw_response,
+        )
+
+    monkeypatch.setattr(LLM, "completion", fake_completion, raising=True)
+
+    async def fake_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        return fake_completion(self, messages, tools, **kwargs)
+
+    monkeypatch.setattr(LLM, "acompletion", fake_acompletion, raising=True)
+    return calls
+
+
+def test_child_launch_in_fresh_workspace_preserves_unborn_repository(
+    server_env, patched_llm
+):
+    workspace = server_env["workspace_path"] / "fresh-parent"
+    workspace.mkdir()
+    original_file = workspace / "parent.txt"
+    original_file.write_text("uncommitted parent work\n")
+    with httpx.Client(base_url=server_env["host"], timeout=30) as client:
+        parent_response = client.post(
+            "/api/conversations",
+            json={
+                "agent": {
+                    "llm": {"model": "gpt-4o-mini", "api_key": "test"},
+                    "tools": [],
+                },
+                "workspace": {"working_dir": str(workspace)},
+                "autotitle": False,
+            },
+        )
+        assert parent_response.status_code == 201
+        parent_id = parent_response.json()["id"]
+        assert (workspace / ".git").is_dir()
+        status_before = run_git_command(["git", "status", "--porcelain"], workspace)
+        head_before = run_git_command(["git", "symbolic-ref", "HEAD"], workspace)
+
+        response = client.post(
+            f"/api/conversations/{parent_id}/children",
+            json={"task": "Reply with ok."},
+        )
+        assert response.status_code == 201, response.text
+        child = response.json()
+        assert child["isolation"] == "shared"
+        assert child["workspace"] == str(workspace)
+        child_id = child["conversation_id"]
+        deadline = time.monotonic() + 10
+        while True:
+            child_info = client.get(f"/api/conversations/{child_id}").json()
+            if child_info["execution_status"] == "finished":
+                break
+            assert time.monotonic() < deadline, child_info["execution_status"]
+            time.sleep(0.05)
+        assert child_info["parent_conversation_id"] == parent_id
+        parent = client.get(f"/api/conversations/{parent_id}").json()
+        assert parent["sub_conversation_ids"] == [child_id]
+        assert (
+            run_git_command(["git", "symbolic-ref", "HEAD"], workspace) == head_before
+        )
+        assert (
+            run_git_command(["git", "status", "--porcelain"], workspace)
+            == status_before
+        )
+        with pytest.raises(GitCommandError):
+            run_git_command(["git", "rev-parse", "--verify", "HEAD"], workspace)
+        assert original_file.read_text() == "uncommitted parent work\n"
+        assert (
+            len(run_git_command(["git", "worktree", "list"], workspace).splitlines())
+            == 1
+        )
+        assert client.delete(f"/api/conversations/{child_id}").status_code == 200
+        assert client.delete(f"/api/conversations/{parent_id}").status_code == 200
+
+
+def test_remote_conversation_websocket_first_message_auth(
+    authenticated_server_env,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "2")
+    agent = Agent(
+        llm=LLM(model="gpt-4o-mini", api_key=SecretStr("test")),
+        tools=[],
+    )
+    workspace = RemoteWorkspace(
+        host=authenticated_server_env["host"],
+        working_dir="/tmp/workspace/project",
+        api_key=authenticated_server_env["api_key"],
+    )
+
+    conversation: RemoteConversation = Conversation(agent=agent, workspace=workspace)
+    try:
+        assert conversation.id
+    finally:
+        conversation.close()
+
+
+def test_preloaded_custom_tool_resolves_in_live_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A startup-preloaded tool is available during live conversation creation."""
+    from openhands.sdk.tool import Tool, registry as tool_registry
+
+    package_name = "preload_live_server_tools_2771"
+    module_qualname = f"{package_name}.tools"
+    package_dir = tmp_path / package_name
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("")
+    (package_dir / "tools.py").write_text(
+        textwrap.dedent(
+            """\
+            from __future__ import annotations
+
+            from collections.abc import Sequence
+            from typing import ClassVar
+
+            from openhands.sdk.tool import (
+                Action,
+                Observation,
+                ToolDefinition,
+                ToolExecutor,
+                register_tool,
+            )
+
+
+            class PreloadedAction(Action):
+                pass
+
+
+            class PreloadedObservation(Observation):
+                pass
+
+
+            class PreloadedExecutor(
+                ToolExecutor[PreloadedAction, PreloadedObservation]
+            ):
+                def __call__(
+                    self,
+                    action: PreloadedAction,
+                    conversation=None,
+                ) -> PreloadedObservation:
+                    return PreloadedObservation.from_text("preloaded")
+
+
+            class PreloadedLiveServerTool(
+                ToolDefinition[PreloadedAction, PreloadedObservation]
+            ):
+                name: ClassVar[str] = "preloaded_live_server_tool"
+
+                @classmethod
+                def create(
+                    cls, conv_state=None, **params
+                ) -> Sequence[PreloadedLiveServerTool]:
+                    return [
+                        cls(
+                            description="Tool registered by startup preload.",
+                            action_type=PreloadedAction,
+                            observation_type=PreloadedObservation,
+                            executor=PreloadedExecutor(),
+                        )
+                    ]
+
+
+            register_tool(PreloadedLiveServerTool.name, PreloadedLiveServerTool)
+            """
+        )
+    )
+
+    registry_snapshot = dict(tool_registry._REG)
+    usability_snapshot = dict(tool_registry._USABILITY_REG)
+    tool_class_snapshot = dict(tool_registry._TOOL_CLASSES)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop(package_name, None)
+    sys.modules.pop(module_qualname, None)
+
+    try:
+        with live_server_env(
+            tmp_path, monkeypatch, import_modules=module_qualname
+        ) as env:
+            llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test"))
+            agent = Agent(
+                llm=llm,
+                tools=[Tool(name="preloaded_live_server_tool")],
+                include_default_tools=[],
+            )
+            payload = {
+                "agent": agent.model_dump(
+                    mode="json", context={"expose_secrets": True}
+                ),
+                "workspace": {"working_dir": "/tmp/workspace/project"},
+                "initial_message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Initialize tools."}],
+                },
+                "tool_module_qualnames": {},
+            }
+
+            with httpx.Client(base_url=env["host"]) as client:
+                response = client.post("/api/conversations", json=payload, timeout=10)
+
+            assert response.status_code == 201, response.text
+            conversation_id = UUID(response.json()["id"])
+            event_service = env["conversation_service"]._event_services[conversation_id]
+            assert event_service._conversation is not None
+            assert (
+                "preloaded_live_server_tool"
+                in event_service._conversation.agent.tools_map
+            )
+    finally:
+        sys.modules.pop(package_name, None)
+        sys.modules.pop(module_qualname, None)
+        tool_registry._REG.clear()
+        tool_registry._REG.update(registry_snapshot)
+        tool_registry._USABILITY_REG.clear()
+        tool_registry._USABILITY_REG.update(usability_snapshot)
+        tool_registry._TOOL_CLASSES.clear()
+        tool_registry._TOOL_CLASSES.update(tool_class_snapshot)
+
+
+def test_websocket_attach_wait_does_not_block_ready_endpoint(server_env):
+    """A blocked websocket snapshot must not stall the live server event loop.
+
+    This exercises the production-shaped failure mode end-to-end: hold a real
+    conversation's synchronous state lock, start a second RemoteConversation that
+    attaches to the same server-side conversation, and verify `/ready` still
+    responds while the websocket subscription is waiting for its initial locked
+    state snapshot.
+    """
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test"))
+    agent = Agent(llm=llm, tools=[])
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/workspace/project"
+    )
+    conv: RemoteConversation = Conversation(agent=agent, workspace=workspace)
+    conversation_id = conv.id
+
+    event_service = server_env["conversation_service"]._event_services[conversation_id]
+    assert event_service is not None
+    assert event_service._conversation is not None
+
+    attach_error: list[BaseException] = []
+    attach_result: dict[str, RemoteConversation] = {}
+    attach_thread = None
+    lock_thread = None
+    lock_acquired = threading.Event()
+    release_state_lock = threading.Event()
+    snapshot_started = threading.Event()
+    conversation_info_started = threading.Event()
+    original_snapshot = event_service._create_state_update_event_sync
+
+    from openhands.agent_server import (
+        conversation_service as conversation_service_module,
+    )
+
+    original_compose_info_sync = (
+        conversation_service_module._compose_conversation_info_sync
+    )
+
+    def traced_snapshot() -> ConversationStateUpdateEvent:
+        snapshot_started.set()
+        return original_snapshot()
+
+    original_initial_state = event_service._create_initial_state_sync
+
+    def traced_initial_state() -> tuple[ConversationStateUpdateEvent, int]:
+        snapshot_started.set()
+        return original_initial_state()
+
+    def traced_compose_info_sync(*args, **kwargs):
+        conversation_info_started.set()
+        return original_compose_info_sync(*args, **kwargs)
+
+    def hold_state_lock() -> None:
+        assert event_service._conversation is not None
+        with event_service._conversation._state:
+            lock_acquired.set()
+            release_state_lock.wait(timeout=5.0)
+
+    def attach_conversation() -> None:
+        attach_workspace = RemoteWorkspace(
+            host=server_env["host"], working_dir="/tmp/workspace/project"
+        )
+        try:
+            attach_result["conversation"] = Conversation(
+                agent=agent,
+                workspace=attach_workspace,
+                conversation_id=conversation_id,
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced by assertions
+            attach_error.append(exc)
+
+    event_service._create_state_update_event_sync = traced_snapshot
+    event_service._create_initial_state_sync = traced_initial_state
+    conversation_service_module._compose_conversation_info_sync = (
+        traced_compose_info_sync
+    )
+
+    try:
+        lock_thread = threading.Thread(target=hold_state_lock, daemon=True)
+        lock_thread.start()
+        assert lock_acquired.wait(timeout=2.0), (
+            "Failed to acquire the conversation state lock for the live-server "
+            "reproduction"
+        )
+
+        attach_thread = threading.Thread(target=attach_conversation, daemon=True)
+        attach_thread.start()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not (
+            conversation_info_started.is_set() or snapshot_started.is_set()
+        ):
+            time.sleep(0.01)
+        assert conversation_info_started.is_set() or snapshot_started.is_set(), (
+            "The conversation attach never reached a state snapshot"
+        )
+        assert attach_thread.is_alive(), (
+            "Expected conversation attach to still be waiting on the state lock"
+        )
+
+        ready_started = time.monotonic()
+        with httpx.Client() as client:
+            ready_response = client.get(f"{server_env['host']}/ready", timeout=1.0)
+        ready_elapsed = time.monotonic() - ready_started
+
+        assert ready_response.status_code == 200
+        assert ready_response.json() == {"status": "ready"}
+        assert ready_elapsed < 0.5, (
+            f"/ready took {ready_elapsed:.3f}s while conversation attach was waiting "
+            "for the conversation state lock"
+        )
+    finally:
+        event_service._create_state_update_event_sync = original_snapshot
+        event_service._create_initial_state_sync = original_initial_state
+        conversation_service_module._compose_conversation_info_sync = (
+            original_compose_info_sync
+        )
+        release_state_lock.set()
+        if lock_thread is not None:
+            lock_thread.join(timeout=2.0)
+        if attach_thread is not None:
+            attach_thread.join(timeout=10.0)
+        attached_conv = attach_result.get("conversation")
+        if attached_conv is not None:
+            attached_conv.close()
+        conv.close()
+
+    assert not attach_error, (
+        f"Attaching to the existing conversation failed: {attach_error[0]}"
+    )
+    assert attach_thread is not None
+    assert not attach_thread.is_alive(), "Websocket attach never finished"
+    attached_conv = attach_result.get("conversation")
+    assert attached_conv is not None
+    assert attached_conv.id == conversation_id
+
+
+def test_remote_conversation_over_real_server(server_env, patched_llm):
+    import shutil
+    from pathlib import Path
+
+    # Create an Agent with a real LLM object (patched for determinism)
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test"))
+    agent = Agent(llm=llm, tools=[])
+
+    # Create conversation via factory pointing at the live server
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/workspace/project"
+    )
+    conv: RemoteConversation = Conversation(
+        agent=agent, workspace=workspace
+    )  # RemoteConversation
+
+    # Lifecycle inspection/reprovision is available without a Docker backend.
+    runtime_url = f"{server_env['host']}/api/conversations/{conv.id}/runtime"
+    with httpx.Client() as client:
+        before = client.get(runtime_url)
+        before.raise_for_status()
+        assert before.json() == {
+            "runtime_status": "available",
+            "can_resume": True,
+            "runtime_error": None,
+        }
+        after = client.post(runtime_url + "/reprovision")
+        after.raise_for_status()
+        assert after.json() == before.json()
+
+    # Send a message and run
+    conv.send_message("Say hello")
+    conv.run()
+
+    # Validate state transitions and that we received an assistant message
+    state = conv.state
+    assert state.execution_status.value in {"finished", "idle", "running"}
+
+    # Wait for WS-delivered events and validate them using proper type checking
+    found_state_update = False
+    found_agent_event = False
+
+    for i in range(50):  # up to ~5s
+        events = state.events
+
+        # Validate event types using isinstance checks (not hasattr/getattr)
+        for e in events:
+            assert isinstance(
+                e,
+                (
+                    MessageEvent,
+                    ActionEvent,
+                    ObservationEvent,
+                    AgentErrorEvent,
+                    Event,
+                    LLMConvertibleEvent,
+                    SystemPromptEvent,
+                    PauseEvent,
+                    CondensationSummaryEvent,
+                    ConversationStateUpdateEvent,
+                ),
+            ), f"Unexpected event type: {type(e).__name__}"
+
+        # Check for expected event types with proper isinstance checks
+        for e in events:
+            if isinstance(e, SystemPromptEvent) and e.source == "agent":
+                found_agent_event = True
+
+            if isinstance(e, ConversationStateUpdateEvent):
+                found_state_update = True
+                # Verify it has the expected structure
+                assert e.source == "environment", (
+                    "ConversationStateUpdateEvent should have source='environment'"
+                )
+
+            # Validate MessageEvent structure when found
+            if isinstance(e, MessageEvent) and e.source == "agent":
+                assert hasattr(e, "llm_message"), (
+                    "MessageEvent should have llm_message attribute"
+                )
+                assert e.llm_message.role in ("assistant", "user"), (
+                    f"Expected role to be assistant or user, got {e.llm_message.role}"
+                )
+                found_agent_event = True
+
+            # Validate ActionEvent structure when found
+            if isinstance(e, ActionEvent) and e.source == "agent":
+                assert hasattr(e, "tool_name"), (
+                    "ActionEvent should have tool_name attribute"
+                )
+                found_agent_event = True
+
+        # We check for agent-related events and state updates.
+        # Note: SystemPromptEvent may not be delivered via WebSocket due to a race
+        # condition where the event is published before the WebSocket subscription
+        # completes. The event IS persisted on the server, but RemoteEventsList
+        # may miss it. See: https://github.com/OpenHands/software-agent-sdk/issues/1785
+        if found_agent_event and found_state_update:
+            break
+        time.sleep(0.1)
+
+    # Assert we got the expected events with descriptive messages
+    assert found_state_update, (
+        f"Expected to find ConversationStateUpdateEvent. "
+        f"Found {len(state.events)} events: {[type(e).__name__ for e in state.events]}"
+    )
+    assert found_agent_event, (
+        "Expected to find an agent event "
+        "(SystemPromptEvent, MessageEvent, or ActionEvent). "
+        f"Found {len(state.events)} events: {
+            [
+                (
+                    type(e).__name__,
+                    e.source
+                    if isinstance(
+                        e,
+                        (
+                            MessageEvent,
+                            ActionEvent,
+                            SystemPromptEvent,
+                            ConversationStateUpdateEvent,
+                        ),
+                    )
+                    else 'N/A',
+                )
+                for e in state.events
+            ]
+        }"
+    )
+
+    conv.close()
+
+    # Clean up any conversation directories that might have been created in cwd
+    cwd_conversations = Path("workspace/conversations")
+    if cwd_conversations.exists():
+        shutil.rmtree(cwd_conversations)
+
+
+@pytest.mark.parametrize(
+    "tags", [None, {"purpose": "debugging"}, {"title": "user tag"}]
+)
+def test_remote_fork_title_stays_out_of_tags(server_env, tags: dict[str, str] | None):
+    agent = Agent(llm=LLM(model="gpt-4o-mini", usage_id="test"), tools=[])
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir=str(server_env["workspace_path"])
+    )
+    source = Conversation(agent=agent, workspace=workspace, tags={"source": "original"})
+    expected_tags = tags or {}
+    assert isinstance(source, RemoteConversation)
+    try:
+        fork = source.fork(title="Debug investigation", tags=tags)
+        try:
+            response = httpx.get(f"{server_env['host']}/api/conversations/{fork.id}")
+            response.raise_for_status()
+            assert response.json()["title"] == "Debug investigation"
+            assert response.json()["tags"] == expected_tags
+
+            pause = httpx.post(
+                f"{server_env['host']}/api/conversations/prepare-for-sandbox-pause"
+            )
+            pause.raise_for_status()
+            state_file = (
+                server_env["conversation_service"].conversations_dir
+                / fork.id.hex
+                / "base_state.json"
+            )
+            assert json.loads(state_file.read_text())["tags"] == expected_tags
+            metadata_file = state_file.with_name("meta.json")
+            assert json.loads(metadata_file.read_text())["tags"] == expected_tags
+            reloaded = httpx.get(f"{server_env['host']}/api/conversations/{fork.id}")
+            reloaded.raise_for_status()
+            assert reloaded.json()["title"] == "Debug investigation"
+            assert reloaded.json()["tags"] == expected_tags
+        finally:
+            fork.close()
+    finally:
+        source.close()
+
+
+def test_remote_conversation_created_from_agent_settings(server_env):
+    from openhands.sdk.conversation.request import StartConversationRequest
+    from openhands.sdk.workspace import LocalWorkspace
+
+    working_dir = str(server_env["workspace_path"])
+    conversation = RemoteConversation.create(
+        RemoteWorkspace(host=server_env["host"], working_dir=working_dir),
+        StartConversationRequest(
+            agent_settings={
+                "agent_kind": "openhands",
+                "llm": {"model": "settings-model", "api_key": "sk-settings"},
+                "tools": [],
+            },
+            workspace=LocalWorkspace(working_dir=working_dir),
+        ),
+        visualizer=None,
+    )
+
+    assert conversation.agent.llm.model == "settings-model"
+    conversation.close()
+
+
+def test_openai_chat_completions_gateway_over_real_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, patched_llm
+):
+    from openhands.sdk.llm.llm_profile_store import LLMProfileStore
+
+    monkeypatch.delenv("OH_WEBHOOKS_0_BASE_URL", raising=False)
+
+    # Where the live server's own stores keep LLM profiles (live_server_env
+    # points OH_PERSISTENCE_DIR at ``tmp_path / ".openhands"``).
+    profiles_dir = tmp_path / ".openhands" / "profiles"
+    store = LLMProfileStore(base_dir=profiles_dir)
+    store.save(
+        "smoke",
+        LLM(model="gpt-4o-mini", api_key=SecretStr("test")),
+        include_secrets=True,
+    )
+
+    with live_server_env(tmp_path, monkeypatch) as env:
+        with httpx.Client() as client:
+            models_response = client.get(f"{env['host']}/v1/models", timeout=2.0)
+            assert models_response.status_code == 200
+            assert models_response.json()["data"] == [
+                {
+                    "id": "openhands_smoke",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "openhands",
+                }
+            ]
+
+            response = client.post(
+                f"{env['host']}/v1/chat/completions",
+                json={
+                    "model": "openhands_smoke",
+                    "messages": [
+                        {"role": "system", "content": "Answer briefly."},
+                        {"role": "user", "content": "Say hello."},
+                    ],
+                },
+                timeout=10.0,
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["object"] == "chat.completion"
+            assert body["model"] == "openhands_smoke"
+            assert body["choices"][0]["message"] == {
+                "role": "assistant",
+                "content": "Hello from patched LLM",
+            }
+            assert body["usage"] == {
+                "prompt_tokens": 7,
+                "completion_tokens": 5,
+                "total_tokens": 12,
+            }
+            conversation_id = response.headers["X-OpenHands-ServerConversation-ID"]
+            UUID(conversation_id)
+            persisted_response = client.get(
+                f"{env['host']}/api/conversations/{conversation_id}", timeout=2.0
+            )
+            assert persisted_response.status_code == 200
+            assert persisted_response.json()["workspace"]["working_dir"] == str(
+                env["workspace_path"]
+            )
+
+            reused_response = client.post(
+                f"{env['host']}/v1/chat/completions",
+                headers={"X-OpenHands-ServerConversation-ID": conversation_id},
+                json={
+                    "model": "openhands_smoke",
+                    "messages": [
+                        {"role": "user", "content": "Say hello again."},
+                    ],
+                },
+                timeout=10.0,
+            )
+            assert reused_response.status_code == 200
+            assert (
+                reused_response.headers["X-OpenHands-ServerConversation-ID"]
+                == conversation_id
+            )
+            assert reused_response.json()["choices"][0]["message"] == {
+                "role": "assistant",
+                "content": "Hello from patched LLM",
+            }
+            # A continued turn reports only its own model call, not the
+            # conversation's running total (7/5 per call, two calls so far).
+            assert reused_response.json()["usage"] == {
+                "prompt_tokens": 7,
+                "completion_tokens": 5,
+                "total_tokens": 12,
+            }
+
+            from openai import BadRequestError, OpenAI
+
+            openai_client = OpenAI(
+                api_key="unused",
+                base_url=f"{env['host']}/v1",
+                timeout=10,
+            )
+            reused_stream = openai_client.chat.completions.create(
+                model="openhands_smoke",
+                messages=[{"role": "user", "content": "Say hello a third time."}],
+                stream=True,
+                stream_options={"include_usage": True},
+                extra_headers={"X-OpenHands-ServerConversation-ID": conversation_id},
+            )
+            reused_usage = [chunk.usage for chunk in reused_stream if chunk.usage]
+            assert len(reused_usage) == 1
+            assert reused_usage[0].prompt_tokens == 7
+            assert reused_usage[0].completion_tokens == 5
+            assert reused_usage[0].total_tokens == 12
+
+            stream = openai_client.chat.completions.create(
+                model="openhands_smoke",
+                messages=[
+                    {"role": "developer", "content": "Answer tersely."},
+                    {"role": "user", "content": "Say hello as a stream."},
+                ],
+                stream=True,
+                stream_options={"include_usage": True},
+                user="compat-test-user",
+            )
+            chunks = list(stream)
+            streamed_text = "".join(
+                chunk.choices[0].delta.content or ""
+                for chunk in chunks
+                if chunk.choices
+            )
+            usage_chunks = [chunk.usage for chunk in chunks if chunk.usage]
+            assert streamed_text == "Hello from patched LLM"
+            assert usage_chunks[-1].prompt_tokens == 7
+            assert usage_chunks[-1].completion_tokens == 5
+            assert usage_chunks[-1].total_tokens == 12
+
+            stream = openai_client.chat.completions.create(
+                model="openhands_smoke",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "Say hello as a default stream.",
+                    },
+                ],
+                stream=True,
+            )
+            chunks = list(stream)
+            streamed_text = "".join(
+                chunk.choices[0].delta.content or ""
+                for chunk in chunks
+                if chunk.choices
+            )
+            usage_chunks = [chunk.usage for chunk in chunks if chunk.usage]
+            assert streamed_text == "Hello from patched LLM"
+            assert usage_chunks == []
+
+            raw_response = openai_client.responses.with_raw_response.create(
+                model="openhands_smoke",
+                instructions="Answer briefly.",
+                input="Say hello through Responses.",
+                store=False,
+            )
+            responses_result = raw_response.parse()
+            assert responses_result.object == "response"
+            assert responses_result.status == "completed"
+            assert responses_result.model == "openhands_smoke"
+            assert responses_result.output_text == "Hello from patched LLM"
+            assert responses_result.previous_response_id is None
+            assert responses_result.usage is not None
+            assert responses_result.usage.input_tokens == 7
+            assert responses_result.usage.output_tokens == 5
+            assert responses_result.usage.total_tokens == 12
+            assert responses_result.id.startswith("resp_")
+            UUID(hex=responses_result.id.removeprefix("resp_"))
+            response_system_text = "\n".join(
+                part.text
+                for message in patched_llm[-1]
+                if message.role == "system"
+                for part in message.content
+                if isinstance(part, TextContent)
+            )
+            response_user_text = "\n".join(
+                part.text
+                for message in patched_llm[-1]
+                if message.role == "user"
+                for part in message.content
+                if isinstance(part, TextContent)
+            )
+            assert "Answer briefly." in response_system_text
+            assert "Answer briefly." not in response_user_text
+            assert "Say hello through Responses." in response_user_text
+
+            responses_conversation_id = raw_response.headers[
+                "X-OpenHands-ServerConversation-ID"
+            ]
+            UUID(responses_conversation_id)
+
+            llm_calls_before_rejected_continuation = len(patched_llm)
+            with pytest.raises(BadRequestError) as exc_info:
+                openai_client.responses.create(
+                    model="openhands_smoke",
+                    input="This must not continue server-side.",
+                    previous_response_id=responses_result.id,
+                    store=False,
+                )
+            assert exc_info.value.status_code == 400
+            assert exc_info.value.response.json()["detail"] == (
+                "previous_response_id is not supported; replay input items instead"
+            )
+            assert len(patched_llm) == llm_calls_before_rejected_continuation
+
+            second_stateless_response = (
+                openai_client.responses.with_raw_response.create(
+                    model="openhands_smoke",
+                    input=[
+                        {
+                            "role": "developer",
+                            "content": "Use replayed context.",
+                        },
+                        {
+                            "role": "user",
+                            "content": "Say hello through Responses.",
+                        },
+                        *[
+                            cast(
+                                ResponseInputItemParam,
+                                item.model_dump(mode="json", exclude_none=True),
+                            )
+                            for item in responses_result.output
+                        ],
+                        {
+                            "role": "user",
+                            "content": "Follow up using the prior answer.",
+                        },
+                    ],
+                    store=False,
+                )
+            )
+            second_stateless_result = second_stateless_response.parse()
+            assert second_stateless_result.output_text == "Hello from patched LLM"
+            assert (
+                second_stateless_response.headers["X-OpenHands-ServerConversation-ID"]
+                != responses_conversation_id
+            )
+            stateless_system_text = "\n".join(
+                part.text
+                for message in patched_llm[-1]
+                if message.role == "system"
+                for part in message.content
+                if isinstance(part, TextContent)
+            )
+            stateless_history_text = "\n".join(
+                part.text
+                for message in patched_llm[-1]
+                if message.role == "user"
+                for part in message.content
+                if isinstance(part, TextContent)
+            )
+            assert "Use replayed context." in stateless_system_text
+            assert "Use replayed context." not in stateless_history_text
+            assert '<message role="user">' in stateless_history_text
+            assert '<message role="assistant">' in stateless_history_text
+            assert "Say hello through Responses." in stateless_history_text
+            assert "Hello from patched LLM" in stateless_history_text
+            assert "Follow up using the prior answer." in stateless_history_text
+
+            streaming_response = client.post(
+                f"{env['host']}/v1/responses",
+                json={
+                    "model": "openhands_smoke",
+                    "input": "This must not run as a buffered stream.",
+                    "stream": True,
+                },
+                timeout=2.0,
+            )
+            assert streaming_response.status_code == 400
+            assert streaming_response.json()["detail"] == (
+                "Streaming responses are not supported yet"
+            )
+
+            store_response = client.post(
+                f"{env['host']}/v1/responses",
+                json={
+                    "model": "openhands_smoke",
+                    "input": "This must not run as a stored response.",
+                    "store": True,
+                },
+                timeout=2.0,
+            )
+            assert store_response.status_code == 400
+            assert store_response.json()["detail"] == (
+                "Persistent response storage (store=True) is not supported yet"
+            )
+
+
+@pytest.mark.parametrize("mode", ["new", "reused", "docker-inner"])
+def test_openai_gateway_rejects_direct_event_during_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, patched_llm, mode: str
+) -> None:
+    from openhands.sdk.llm.llm_profile_store import LLMProfileStore
+
+    monkeypatch.delenv("OH_WEBHOOKS_0_BASE_URL", raising=False)
+
+    profiles_dir = tmp_path / ".openhands" / "profiles"
+    store = LLMProfileStore(base_dir=profiles_dir)
+    store.save(
+        "smoke",
+        LLM(model="gpt-4o-mini", api_key=SecretStr("test")),
+        include_secrets=True,
+    )
+
+    original_acompletion = LLM.acompletion
+    gateway_started = threading.Event()
+    release_gateway = threading.Event()
+    hold_gateway = {"enabled": False}
+
+    async def gated_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        user_text = "\n".join(
+            part.text
+            for message in messages
+            if message.role == "user"
+            for part in message.content
+            if isinstance(part, TextContent)
+        )
+        if hold_gateway["enabled"] and "Direct turn." not in user_text:
+            gateway_started.set()
+            assert await asyncio.to_thread(release_gateway.wait, 5)
+        result = await original_acompletion(self, messages, tools, **kwargs)
+        reply = "Direct reply" if "Direct turn." in user_text else "Gateway reply"
+        return result.model_copy(
+            update={
+                "message": Message(role="assistant", content=[TextContent(text=reply)])
+            }
+        )
+
+    monkeypatch.setattr(LLM, "acompletion", gated_acompletion)
+
+    with (
+        live_server_env(tmp_path, monkeypatch) as env,
+        httpx.Client(trust_env=False) as client,
+    ):
+        gateway_url = f"{env['host']}/v1/chat/completions"
+        if mode != "new":
+            seed = client.post(
+                gateway_url,
+                json={
+                    "model": "openhands_smoke",
+                    "messages": [{"role": "user", "content": "Start conversation."}],
+                },
+                timeout=10,
+            )
+            assert seed.status_code == 200, seed.text
+            conversation_id = seed.headers["X-OpenHands-ServerConversation-ID"]
+        else:
+            conversation_id = str(uuid4())
+        event_url = f"{env['host']}/api/conversations/{conversation_id}/events"
+
+        hold_gateway["enabled"] = True
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            gateway_endpoint = (
+                f"{event_url}/_gateway/run" if mode == "docker-inner" else gateway_url
+            )
+            gateway_body = (
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Gateway turn."}],
+                    "run": True,
+                }
+                if mode == "docker-inner"
+                else {
+                    "model": "openhands_smoke",
+                    "messages": [{"role": "user", "content": "Gateway turn."}],
+                }
+            )
+            gateway_future = pool.submit(
+                client.post,
+                gateway_endpoint,
+                headers={"X-OpenHands-ServerConversation-ID": conversation_id},
+                json=gateway_body,
+                timeout=10,
+            )
+            try:
+                assert gateway_started.wait(5)
+                direct = pool.submit(
+                    client.post,
+                    event_url,
+                    json={
+                        "content": [{"type": "text", "text": "Direct turn."}],
+                        "run": True,
+                    },
+                    timeout=5,
+                ).result(timeout=5)
+            finally:
+                release_gateway.set()
+            gateway = gateway_future.result(timeout=10)
+
+        assert gateway.status_code == 200, gateway.text
+        assert direct.status_code == 409, direct.text
+        assert direct.json()["detail"] == "Gateway run in progress; message not saved"
+        if mode == "docker-inner":
+            assert gateway.json()["final_response"] == "Gateway reply"
+            assert gateway.json()["usage"]["prompt_tokens"] == 7
+            assert gateway.json()["usage"]["completion_tokens"] == 5
+        else:
+            assert gateway.json()["choices"][0]["message"]["content"] == (
+                "Gateway reply"
+            )
+        user_events = client.get(event_url + "/count", params={"source": "user"})
+        assert user_events.status_code == 200
+        expected_count = 1 + (mode != "new")
+        assert user_events.json() == expected_count
+        assert len(patched_llm) == expected_count
+
+        later = client.post(
+            event_url,
+            json={"content": [{"type": "text", "text": "Later turn."}], "run": False},
+        )
+        assert later.status_code == 200, later.text
+        user_events = client.get(event_url + "/count", params={"source": "user"})
+        assert user_events.status_code == 200
+        assert user_events.json() == expected_count + 1
+
+
+def test_openai_gateway_continues_an_interrupted_conversation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, patched_llm
+) -> None:
+    from openhands.sdk.llm.llm_profile_store import LLMProfileStore
+
+    monkeypatch.delenv("OH_WEBHOOKS_0_BASE_URL", raising=False)
+
+    profiles_dir = tmp_path / ".openhands" / "profiles"
+    store = LLMProfileStore(base_dir=profiles_dir)
+    store.save(
+        "smoke",
+        LLM(model="gpt-4o-mini", api_key=SecretStr("test")),
+        include_secrets=True,
+    )
+
+    original_acompletion = LLM.acompletion
+    direct_started = threading.Event()
+    release_direct = threading.Event()
+
+    async def gated_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        last_user_text = [
+            part.text
+            for message in messages
+            if message.role == "user"
+            for part in message.content
+            if isinstance(part, TextContent)
+        ][-1]
+        if last_user_text == "Direct turn.":
+            direct_started.set()
+            await asyncio.to_thread(release_direct.wait, 5)
+        result = await original_acompletion(self, messages, tools, **kwargs)
+        return result.model_copy(
+            update={
+                "message": Message(
+                    role="assistant",
+                    content=[TextContent(text=f"Reply to: {last_user_text}")],
+                )
+            }
+        )
+
+    monkeypatch.setattr(LLM, "acompletion", gated_acompletion)
+
+    with (
+        live_server_env(tmp_path, monkeypatch) as env,
+        httpx.Client(trust_env=False) as client,
+    ):
+        gateway_url = f"{env['host']}/v1/chat/completions"
+        seed = client.post(
+            gateway_url,
+            json={
+                "model": "openhands_smoke",
+                "messages": [{"role": "user", "content": "Start conversation."}],
+            },
+            timeout=10,
+        )
+        assert seed.status_code == 200, seed.text
+        conversation_id = seed.headers["X-OpenHands-ServerConversation-ID"]
+        conversation_url = f"{env['host']}/api/conversations/{conversation_id}"
+
+        direct = client.post(
+            f"{conversation_url}/events",
+            json={"content": [{"type": "text", "text": "Direct turn."}], "run": True},
+            timeout=5,
+        )
+        assert direct.status_code == 200, direct.text
+        try:
+            assert direct_started.wait(5)
+            interrupted = client.post(f"{conversation_url}/interrupt", timeout=10)
+        finally:
+            release_direct.set()
+        assert interrupted.status_code == 200, interrupted.text
+        deadline = time.monotonic() + 5
+        while client.get(conversation_url).json()["execution_status"] != "paused":
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+
+        gateway = client.post(
+            gateway_url,
+            headers={"X-OpenHands-ServerConversation-ID": conversation_id},
+            json={
+                "model": "openhands_smoke",
+                "messages": [{"role": "user", "content": "Gateway turn."}],
+            },
+            timeout=15,
+        )
+
+        assert gateway.status_code == 200, gateway.text
+        assert gateway.json()["choices"][0]["message"]["content"] == (
+            "Reply to: Gateway turn."
+        )
+        assert gateway.headers["X-OpenHands-ServerConversation-ID"] == conversation_id
+        gateway_turns = client.get(
+            f"{conversation_url}/events/search",
+            params={"source": "user", "body": "Gateway turn."},
+        )
+        assert len(gateway_turns.json()["items"]) == 1
+        assert client.get(conversation_url).json()["execution_status"] == "finished"
+
+
+def test_openai_gateway_replays_frozen_llm_fixtures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import asyncio
+
+    from openai import OpenAI
+
+    from openhands.agent_server.models import StartConversationRequest
+    from openhands.sdk import Message, TextContent
+    from openhands.sdk.llm.llm_profile_store import LLMProfileStore
+    from openhands.sdk.testing import TestLLM
+    from openhands.sdk.workspace import LocalWorkspace
+
+    monkeypatch.delenv("OH_WEBHOOKS_0_BASE_URL", raising=False)
+
+    fixtures_dir = Path(__file__).parents[1] / "fixtures" / "openai_gateway"
+    fixtures = [
+        json.loads((fixtures_dir / "openai_nano_completion.json").read_text()),
+        json.loads((fixtures_dir / "litellm_haiku_completion.json").read_text()),
+    ]
+
+    # Where the live server's own stores keep LLM profiles (live_server_env
+    # points OH_PERSISTENCE_DIR at ``tmp_path / ".openhands"``).
+    profiles_dir = tmp_path / ".openhands" / "profiles"
+    store = LLMProfileStore(base_dir=profiles_dir)
+    for fixture in fixtures:
+        store.save(
+            fixture["profile_name"],
+            LLM(model=fixture["backing_model"], api_key=SecretStr("unused")),
+            include_secrets=True,
+        )
+
+    async def start_conversation_with_test_llm(conversation_service, llm: TestLLM):
+        request = StartConversationRequest(
+            agent=Agent(
+                llm=LLM(model="gpt-4o-mini", api_key=SecretStr("unused")),
+                tools=[],
+            ),
+            workspace=LocalWorkspace(working_dir=str(tmp_path / "workspace")),
+            autotitle=False,
+        )
+        info, _ = await conversation_service.start_conversation(request)
+        event_service = await conversation_service.get_event_service(info.id)
+        assert event_service is not None
+        event_service.get_conversation().switch_llm(llm)
+        return info.id
+
+    with live_server_env(tmp_path, monkeypatch) as env:
+        for fixture in fixtures:
+            expected_content = fixture["response"]["choices"][0]["message"]["content"]
+            llm = TestLLM.from_messages(
+                [
+                    Message(
+                        role="assistant",
+                        content=[TextContent(text=expected_content)],
+                    )
+                ],
+                model=fixture["backing_model"],
+                usage_id=f"frozen-{fixture['profile_name']}",
+            )
+            conversation_id = asyncio.run(
+                start_conversation_with_test_llm(env["conversation_service"], llm)
+            )
+            client = OpenAI(
+                api_key="unused",
+                base_url=f"{env['host']}/v1",
+                default_headers={
+                    "X-OpenHands-ServerConversation-ID": str(conversation_id)
+                },
+                timeout=10,
+            )
+            completion = client.chat.completions.create(
+                model=fixture["gateway_model"],
+                messages=fixture["messages"],
+            )
+
+            assert completion.model == fixture["gateway_model"]
+            assert completion.choices[0].message.content == expected_content
+            assert llm.call_count == 1
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="The live bash endpoint depends on the Unix terminal backend.",
+)
+def test_bash_command_endpoint_with_live_server(server_env):
+    """Integration test for bash command execution through live server.
+
+    This test validates that the /api/bash/start_bash_command endpoint works
+    correctly end-to-end by:
+    1. Starting a real FastAPI server with bash endpoints
+    2. Creating a RemoteWorkspace pointing to that server
+    3. Executing a real bash command
+    4. Verifying the actual command output
+
+    This is a regression test for issue #866 where bash execution was broken
+    due to using the wrong endpoint URL.
+    """
+    # Create a RemoteWorkspace pointing to the live server
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/test_workspace"
+    )
+
+    # Execute a bash command that produces verifiable output
+    # Test multiple commands to ensure command chaining works
+    command = "echo 'Hello from live bash endpoint!' && echo 'Line 2' && expr 5 + 3"
+    result = workspace.execute_command(command, timeout=10.0)
+
+    # Verify the command executed successfully
+    assert result.exit_code == 0, (
+        f"Command failed with exit code {result.exit_code}. "
+        f"stdout: {result.stdout}, stderr: {result.stderr}"
+    )
+    assert result.timeout_occurred is False, (
+        "Command timed out - this suggests the endpoint is not working correctly"
+    )
+
+    # Verify the actual output contains all our expected text
+    assert "Hello from live bash endpoint!" in result.stdout, (
+        f"Expected 'Hello from live bash endpoint!' not found in stdout: "
+        f"{result.stdout}"
+    )
+    assert "Line 2" in result.stdout, (
+        f"Expected 'Line 2' not found in stdout: {result.stdout}"
+    )
+    assert "8" in result.stdout, (
+        f"Expected '8' (result of 5+3) not found in stdout: {result.stdout}"
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="The live bash endpoint depends on the Unix terminal backend.",
+)
+def test_stop_bash_command_endpoint_with_live_server(server_env):
+    """Stop a long-running command through the live server end to end."""
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/test_workspace"
+    )
+    command_id = workspace.start_command("sleep 30", timeout=60.0)
+    workspace.stop_command(command_id)
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        output = workspace.get_command_output(command_id)
+        if output is not None and output.get("exit_code") is not None:
+            break
+        time.sleep(0.2)
+    else:
+        pytest.fail(f"command {command_id} did not finish after stop")
+
+
+def test_file_upload_endpoint_with_live_server(server_env, tmp_path: Path):
+    """Integration test for file upload through live server.
+
+    This test validates that the /api/file/upload endpoint works
+    correctly end-to-end by:
+    1. Starting a real FastAPI server with file upload endpoints
+    2. Creating a RemoteWorkspace pointing to that server
+    3. Creating a test file and uploading it
+    4. Verifying the file was uploaded to the correct location with correct content
+    """
+    # Create a RemoteWorkspace pointing to the live server
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/test_workspace"
+    )
+
+    # Create a test file to upload
+    test_file = tmp_path / "test_upload.txt"
+    test_content = "Hello from file upload test!\nThis is line 2.\n"
+    test_file.write_text(test_content)
+
+    # Define the destination path (must be absolute for the server)
+    destination = server_env["workspace_path"] / "uploaded_file.txt"
+    destination_remote = destination.as_posix()
+
+    # Upload the file
+    result = workspace.file_upload(str(test_file), destination)
+
+    # Verify the upload was successful
+    assert result.success is True, (
+        f"File upload failed. Error: {result.error}, "
+        f"Source: {result.source_path}, Destination: {result.destination_path}"
+    )
+    assert result.source_path == str(test_file), (
+        f"Expected source_path to be {test_file}, got {result.source_path}"
+    )
+    assert result.destination_path == destination_remote, (
+        f"Expected destination_path to be {destination_remote}, "
+        f"got {result.destination_path}"
+    )
+
+    downloaded_file = tmp_path / "downloaded_upload.txt"
+    download_result = workspace.file_download(destination, downloaded_file)
+    assert download_result.success is True, (
+        f"File download failed. Error: {download_result.error}, "
+        f"Source: {download_result.source_path}, "
+        f"Destination: {download_result.destination_path}"
+    )
+    assert downloaded_file.read_text() == test_content
+
+
+def test_conversation_stats_with_live_server(
+    server_env, monkeypatch: pytest.MonkeyPatch
+):
+    """Integration test verifying conversation stats are correctly propagated.
+
+    This test validates the fix for issue #1041 where accumulated cost was
+    always 0. It checks:
+    1. RemoteConversation reads stats from the correct 'stats' field (not
+       'conversation_stats')
+    2. Stats updates are propagated after run() completes
+    3. Accumulated cost and token usage are correctly tracked
+
+    This is a regression test for the field mismatch and state update issues.
+    """
+
+    def fake_completion_with_cost(
+        self,
+        messages,
+        tools,
+        add_security_risk_prediction=False,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        from openhands.sdk.llm.llm_response import LLMResponse
+        from openhands.sdk.llm.message import Message
+        from openhands.sdk.llm.utils.metrics import TokenUsage
+
+        # Create a minimal ModelResponse with a single assistant message
+        litellm_msg = LiteLLMMessage.model_validate(
+            {"role": "assistant", "content": "Test response"}
+        )
+        raw_response = ModelResponse(
+            id="test-resp-with-cost",
+            created=int(time.time()),
+            model="test-model",
+            choices=[Choices(index=0, finish_reason="stop", message=litellm_msg)],
+        )
+
+        # Convert to OpenHands Message
+        message = Message.from_llm_chat_message(litellm_msg)
+
+        # Simulate cost accumulation in the LLM's metrics
+        # The LLM should have metrics that track cost
+        from openhands.sdk.llm.utils.metrics import MetricsSnapshot
+
+        if self.metrics:
+            self.metrics.add_cost(0.0025)
+            self.metrics.add_token_usage(
+                prompt_tokens=100,
+                completion_tokens=50,
+                cache_read_tokens=0,
+                cache_write_tokens=0,
+                context_window=8192,
+                response_id="test-resp-with-cost",
+                reasoning_tokens=0,
+            )
+            metrics_snapshot = self.metrics.get_snapshot()
+        else:
+            # Create a default metrics snapshot if no metrics exist
+            metrics_snapshot = MetricsSnapshot(
+                model_name=self.model,
+                accumulated_cost=0.0025,
+                accumulated_token_usage=TokenUsage(
+                    model=self.model,
+                    prompt_tokens=100,
+                    completion_tokens=50,
+                    response_id="test-resp-with-cost",
+                ),
+            )
+
+        return LLMResponse(
+            message=message, metrics=metrics_snapshot, raw_response=raw_response
+        )
+
+    # Patch LLM.completion with our cost-tracking version
+    monkeypatch.setattr(LLM, "completion", fake_completion_with_cost, raising=True)
+
+    async def fake_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        return fake_completion_with_cost(self, messages, tools, **kwargs)
+
+    monkeypatch.setattr(LLM, "acompletion", fake_acompletion, raising=True)
+
+    # Create an Agent with a real LLM object
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test"))
+    agent = Agent(llm=llm, tools=[])
+
+    # Create conversation via factory pointing at the live server
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/workspace/project"
+    )
+    conv: RemoteConversation = Conversation(agent=agent, workspace=workspace)
+
+    # Verify initial stats are empty/zero
+    initial_stats = conv.conversation_stats
+    assert initial_stats is not None
+    initial_cost = initial_stats.get_combined_metrics().accumulated_cost
+    assert initial_cost == 0.0, f"Expected initial cost to be 0.0, got {initial_cost}"
+
+    # Send a message and run the conversation
+    conv.send_message("Test message")
+    conv.run()
+
+    # Wait for the conversation to finish and stats to update
+    # The fix ensures stats are published after run() completes
+    max_attempts = 50
+    for attempt in range(max_attempts):
+        try:
+            stats = conv.conversation_stats
+            combined_metrics = stats.get_combined_metrics()
+            accumulated_cost = combined_metrics.accumulated_cost
+
+            # Check if we got non-zero cost (stats have been updated)
+            if accumulated_cost > 0:
+                # Verify the stats are correctly populated
+                assert accumulated_cost > 0, (
+                    f"Expected accumulated_cost > 0 after run(), got {accumulated_cost}"
+                )
+
+                # Verify token usage is tracked
+                if combined_metrics.accumulated_token_usage:
+                    assert combined_metrics.accumulated_token_usage.prompt_tokens > 0, (
+                        "Expected prompt_tokens > 0 after run()"
+                    )
+                    assert (
+                        combined_metrics.accumulated_token_usage.completion_tokens > 0
+                    ), "Expected completion_tokens > 0 after run()"
+
+                # Success - we got updated stats
+                break
+        except (KeyError, AttributeError, AssertionError) as e:
+            if attempt == max_attempts - 1:
+                raise AssertionError(
+                    f"Stats not properly updated after {max_attempts} attempts. "
+                    f"Last error: {e}"
+                )
+        time.sleep(0.1)
+
+    # Final verification: stats are read from 'stats' field, not 'conversation_stats'
+    info = conv.state._get_conversation_info()
+    assert "stats" in info, "Expected 'stats' field in conversation info"
+
+    # Verify the RemoteConversation is correctly reading from 'stats'
+    stats_from_field = info.get("stats", {})
+    assert stats_from_field, "Expected non-empty stats in the 'stats' field after run()"
+
+    conv.close()
+
+
+def _metrics_exceeding_frame_limit() -> Metrics:
+    metrics = Metrics(model_name="gpt-4o-mini")
+    calls = 0
+    while len(metrics.model_dump_json()) <= MAX_FRAME_BYTES:
+        for _ in range(500):
+            response_id = f"chatcmpl-{calls:06d}-{uuid4().hex}"
+            metrics.add_cost(0.0123)
+            metrics.add_token_usage(
+                prompt_tokens=120_000,
+                completion_tokens=512,
+                cache_read_tokens=110_000,
+                cache_write_tokens=2_048,
+                context_window=200_000,
+                response_id=response_id,
+                reasoning_tokens=256,
+            )
+            metrics.add_response_latency(3.21, response_id)
+            calls += 1
+    return metrics
+
+
+def test_long_conversation_full_state_fits_session_frame(server_env):
+    """Per-call metrics over 4 MiB must not break reconnects (#6741)."""
+    ws_host = server_env["host"].replace("http://", "ws://")
+    with httpx.Client(base_url=server_env["host"]) as client:
+        conversation_id = _start_idle_conversation(client)
+        event_service = server_env["conversation_service"]._event_services[
+            UUID(conversation_id)
+        ]
+        state = event_service.get_conversation()._state
+        metrics = _metrics_exceeding_frame_limit()
+        with state:
+            state.stats = ConversationStats(usage_to_metrics={"agent": metrics})
+        assert len(state.model_dump_json()) > MAX_FRAME_BYTES
+
+        full_state = None
+        with connect(
+            f"{ws_host}/sockets/session/{conversation_id}", max_size=None
+        ) as ws:
+            while full_state is None:
+                frame = json.loads(ws.recv(timeout=10))
+                event = frame.get("event") or {}
+                if event.get("key") == "full_state":
+                    full_state = event["value"]
+
+        served = full_state["stats"]["usage_to_metrics"]["agent"]
+        assert "costs" not in served
+        assert "response_latencies" not in served
+        assert "token_usages" not in served
+        assert served["accumulated_cost"] == pytest.approx(metrics.accumulated_cost)
+        assert metrics.accumulated_token_usage is not None
+        assert (
+            served["accumulated_token_usage"]
+            == metrics.accumulated_token_usage.model_dump()
+        )
+
+        for response in (
+            client.get(f"/api/conversations/{conversation_id}"),
+            client.get("/api/conversations/search"),
+        ):
+            response.raise_for_status()
+            assert len(response.content) < 100_000
+        # Persistence still keeps every call.
+        persisted = json.loads(
+            (Path(event_service.conversation_dir) / "base_state.json").read_text()
+        )
+        assert len(persisted["stats"]["usage_to_metrics"]["agent"]["costs"]) == len(
+            metrics.costs
+        )
+
+
+def test_ask_agent_usage_is_in_conversation_info_at_once(server_env, patched_llm):
+    """GET /api/conversations/{id} counts a side question's usage as soon as
+    ask_agent returns, with no run or other state change after it.
+    """
+    agent = Agent(llm=LLM(model="gpt-4o-mini", api_key=SecretStr("test")), tools=[])
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/workspace/project"
+    )
+    conv: RemoteConversation = Conversation(agent=agent, workspace=workspace)
+    try:
+        conv.ask_agent("How's the progress?")
+
+        with httpx.Client(base_url=server_env["host"]) as client:
+            response = client.get(f"/api/conversations/{conv.id}")
+        response.raise_for_status()
+        usage_to_metrics = response.json()["stats"]["usage_to_metrics"]
+        assert "ask-agent-llm" in usage_to_metrics
+        token_usage = usage_to_metrics["ask-agent-llm"]["accumulated_token_usage"]
+        assert token_usage["prompt_tokens"] == 7  # one patched_llm call
+    finally:
+        conv.close()
+
+
+def test_events_not_lost_during_client_disconnection(
+    server_env, monkeypatch: pytest.MonkeyPatch
+):
+    """Test that events are NOT lost during client disconnection.
+
+    This is a regression test for the bug described in PR #1791 review where
+    events emitted during client disconnection could be lost. The fix adds a
+    reconciliation sync after run() completes to ensure all events are captured.
+
+    The original bug scenario:
+    1. Test runs conversation with a mocked `finish` tool call
+    2. Server emits `ActionEvent` + `ObservationEvent`
+    3. `conv.run()` returns when status becomes "finished"
+    4. Client starts closing WebSocket
+    5. Events emitted during disconnect may not be delivered via WebSocket
+
+    The fix: After run() completes, we call reconcile() to fetch any events
+    that may have been missed via WebSocket. This ensures the client always
+    has a complete view of all events.
+
+    See PR #1791 review for details: https://github.com/OpenHands/software-agent-sdk/pull/1791#pullrequestreview-3694259068
+    """
+
+    def fake_completion_with_finish_tool(
+        self,
+        messages,
+        tools,
+        add_security_risk_prediction=False,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        from openhands.sdk.llm.llm_response import LLMResponse
+        from openhands.sdk.llm.message import Message
+        from openhands.sdk.llm.utils.metrics import MetricsSnapshot
+
+        # Return a finish tool call to end the conversation
+        litellm_msg = LiteLLMMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_finish",
+                        "type": "function",
+                        "function": {
+                            "name": "finish",
+                            "arguments": '{"message": "Task complete"}',
+                        },
+                    }
+                ],
+            }
+        )
+
+        raw_response = ModelResponse(
+            id="test-resp-finish",
+            created=int(time.time()),
+            model="test-model",
+            choices=[Choices(index=0, finish_reason="stop", message=litellm_msg)],
+        )
+
+        message = Message.from_llm_chat_message(litellm_msg)
+        metrics_snapshot = MetricsSnapshot(
+            model_name="test-model",
+            accumulated_cost=0.0,
+            max_budget_per_task=None,
+            accumulated_token_usage=None,
+        )
+
+        return LLMResponse(
+            message=message, metrics=metrics_snapshot, raw_response=raw_response
+        )
+
+    monkeypatch.setattr(
+        LLM, "completion", fake_completion_with_finish_tool, raising=True
+    )
+
+    async def fake_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        return fake_completion_with_finish_tool(self, messages, tools, **kwargs)
+
+    monkeypatch.setattr(LLM, "acompletion", fake_acompletion, raising=True)
+
+    # Create an Agent with empty tools list (finish is a built-in tool)
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test"))
+    agent = Agent(llm=llm, tools=[])
+
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/workspace/project"
+    )
+    conv: RemoteConversation = Conversation(agent=agent, workspace=workspace)
+
+    # Send message and run - this will trigger the finish tool
+    conv.send_message("Complete the task")
+    conv.run()
+
+    # At this point, conv.run() has returned because status became "finished".
+    # The WebSocket client may have started closing, but the server may still
+    # be trying to send events.
+
+    # Get events received via WebSocket (cached in RemoteEventsList)
+    ws_events = list(conv.state.events)
+
+    # Fetch events directly from REST API to get the authoritative list
+    # This bypasses the WebSocket and shows what's actually persisted on server
+    with httpx.Client(base_url=server_env["host"]) as client:
+        response = client.get(
+            f"/api/conversations/{conv._id}/events/search",
+            params={"limit": 100},
+        )
+        response.raise_for_status()
+        rest_data = response.json()
+        rest_events = [Event.model_validate(item) for item in rest_data["items"]]
+
+    # Count ActionEvents in each source
+    ws_action_events = [
+        e for e in ws_events if isinstance(e, ActionEvent) and e.tool_name == "finish"
+    ]
+    rest_action_events = [
+        e for e in rest_events if isinstance(e, ActionEvent) and e.tool_name == "finish"
+    ]
+
+    ws_observation_events = [
+        e
+        for e in ws_events
+        if isinstance(e, ObservationEvent) and e.tool_name == "finish"
+    ]
+    rest_observation_events = [
+        e
+        for e in rest_events
+        if isinstance(e, ObservationEvent) and e.tool_name == "finish"
+    ]
+
+    # Log what we found for debugging
+    ws_event_summary = [
+        f"{type(e).__name__}({getattr(e, 'tool_name', 'N/A')})" for e in ws_events
+    ]
+    rest_event_summary = [
+        f"{type(e).__name__}({getattr(e, 'tool_name', 'N/A')})" for e in rest_events
+    ]
+
+    conv.close()
+
+    # The bug: Events may be lost during client disconnection
+    # REST API should always have the events (they're persisted)
+    # WebSocket may miss events if they're emitted during disconnect
+
+    # First, verify REST API has the expected events (sanity check)
+    assert len(rest_action_events) >= 1, (
+        f"REST API should have ActionEvent with finish tool. "
+        f"REST events: {rest_event_summary}"
+    )
+    assert len(rest_observation_events) >= 1, (
+        f"REST API should have ObservationEvent with finish tool. "
+        f"REST events: {rest_event_summary}"
+    )
+
+    # Verify client has all events (reconciliation should have fetched any missed)
+    ws_has_action = len(ws_action_events) >= 1
+    ws_has_observation = len(ws_observation_events) >= 1
+
+    # These assertions verify the fix works - reconciliation ensures no events are lost
+    assert ws_has_action, (
+        f"ActionEvent with finish tool not found in client events. "
+        f"REST API has {len(rest_action_events)} ActionEvent(s) but client has "
+        f"{len(ws_action_events)}. Reconciliation should have fetched missing events. "
+        f"Client events: {ws_event_summary}. REST events: {rest_event_summary}"
+    )
+
+    assert ws_has_observation, (
+        f"ObservationEvent with finish tool not found in client events. "
+        f"Client events: {ws_event_summary}"
+    )
+
+
+def test_post_run_reconcile_needed_under_ws_callback_lag(
+    server_env, monkeypatch: pytest.MonkeyPatch
+):
+    """Controlled repro for the *client-side* tail-event race.
+
+    We delay processing of finish-tool WS events in the client's WS callback.
+    This can make `conv.run()` return (polling sees a terminal status) before
+    the WS thread appends the final Action/Observation events.
+
+    Then we show that a REST reconcile after run completion recovers those events.
+
+    This test is intentionally conservative: it doesn't change production logic
+    except for injecting a delay into the client-side callback.
+    """
+
+    ws_delay_s = 0.75
+
+    def fake_completion_with_finish_tool(
+        self,
+        messages,
+        tools,
+        add_security_risk_prediction=False,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        from openhands.sdk.llm.llm_response import LLMResponse
+        from openhands.sdk.llm.message import Message
+        from openhands.sdk.llm.utils.metrics import MetricsSnapshot
+
+        litellm_msg = LiteLLMMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_finish",
+                        "type": "function",
+                        "function": {
+                            "name": "finish",
+                            "arguments": '{"message": "Task complete"}',
+                        },
+                    }
+                ],
+            }
+        )
+
+        raw_response = ModelResponse(
+            id="test-resp-finish",
+            created=int(time.time()),
+            model="test-model",
+            choices=[Choices(index=0, finish_reason="stop", message=litellm_msg)],
+        )
+
+        message = Message.from_llm_chat_message(litellm_msg)
+        metrics_snapshot = MetricsSnapshot(
+            model_name="test-model",
+            accumulated_cost=0.0,
+            max_budget_per_task=None,
+            accumulated_token_usage=None,
+        )
+
+        return LLMResponse(
+            message=message, metrics=metrics_snapshot, raw_response=raw_response
+        )
+
+    monkeypatch.setattr(
+        LLM, "completion", fake_completion_with_finish_tool, raising=True
+    )
+
+    async def fake_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        return fake_completion_with_finish_tool(self, messages, tools, **kwargs)
+
+    monkeypatch.setattr(LLM, "acompletion", fake_acompletion, raising=True)
+
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test"))
+    agent = Agent(llm=llm, tools=[])
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/workspace/project"
+    )
+
+    conv: RemoteConversation = Conversation(agent=agent, workspace=workspace)
+
+    # Inject WS lag *only* for finish Action/Observation events.
+    assert conv._ws_client is not None
+    orig_cb = conv._ws_client.callback
+
+    def delayed_cb(event: Event) -> None:
+        if (
+            isinstance(event, (ActionEvent, ObservationEvent))
+            and getattr(event, "tool_name", None) == "finish"
+        ):
+            time.sleep(ws_delay_s)
+        orig_cb(event)
+
+    conv._ws_client.callback = delayed_cb
+
+    conv.send_message("Complete the task")
+    conv.run()
+
+    ws_events = list(conv.state.events)
+
+    with httpx.Client(base_url=server_env["host"]) as client:
+        response = client.get(
+            f"/api/conversations/{conv._id}/events/search",
+            params={"limit": 100},
+        )
+        response.raise_for_status()
+        rest_data = response.json()
+        rest_events = [Event.model_validate(item) for item in rest_data["items"]]
+
+    ws_action = [
+        e for e in ws_events if isinstance(e, ActionEvent) and e.tool_name == "finish"
+    ]
+    rest_action = [
+        e for e in rest_events if isinstance(e, ActionEvent) and e.tool_name == "finish"
+    ]
+
+    # Server must have persisted the finish ActionEvent.
+    assert len(rest_action) >= 1
+
+    # Under WS lag, the client *may* be missing it immediately.
+    # If we already have it, the system behaved correctly without needing
+    # a post-run reconcile for this timing.
+    #
+    # What we must always ensure is that reconcile() is harmless and yields a
+    # complete event list.
+    if len(ws_action) == 0:
+        # Reconcile after completion should fetch the missing event.
+        conv.state.events.reconcile()
+        ws_events_after = list(conv.state.events)
+        ws_action_after = [
+            e
+            for e in ws_events_after
+            if isinstance(e, ActionEvent) and e.tool_name == "finish"
+        ]
+        assert len(ws_action_after) >= 1
+    else:
+        # Still validate reconcile is idempotent / does not drop events.
+        before_ids = {e.id for e in conv.state.events}
+        conv.state.events.reconcile()
+        after_ids = {e.id for e in conv.state.events}
+        assert before_ids.issubset(after_ids)
+
+    conv.close()
+
+
+@pytest.mark.skip(
+    reason="Flaky due to WebSocket disconnect timing - ActionEvent may be emitted "
+    "after client starts closing, causing delivery failure. This is a separate issue "
+    "from #1785 (subscription race). Test should use REST API for event verification."
+)
+def test_security_risk_field_with_live_server(
+    server_env, monkeypatch: pytest.MonkeyPatch
+):
+    """Integration test validating security_risk field functionality.
+
+    This test validates the fix for issue #819 where security_risk field handling
+    was inconsistent. It tests that:
+    1. Actions execute successfully with security_risk provided
+    2. Actions execute successfully without security_risk (defaults to UNKNOWN)
+
+    This is a regression test spawning a real agent server to ensure end-to-end
+    functionality of security_risk field handling.
+    """
+
+    # Track which completion call we're on to control behavior
+    call_count = {"count": 0}
+
+    def fake_completion_with_tool_calls(
+        self,
+        messages,
+        tools,
+        add_security_risk_prediction=False,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        from openhands.sdk.llm.llm_response import LLMResponse
+        from openhands.sdk.llm.message import Message
+        from openhands.sdk.llm.utils.metrics import MetricsSnapshot
+
+        call_count["count"] += 1
+
+        # First call: return tool call WITHOUT security_risk
+        # (to test error event when analyzer is configured)
+        if call_count["count"] == 1:
+            litellm_msg = LiteLLMMessage.model_validate(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "finish",
+                                "arguments": '{"message": "Task complete"}',
+                            },
+                        }
+                    ],
+                }
+            )
+        # Second call: return tool call WITH security_risk
+        # (to test successful execution after error)
+        elif call_count["count"] == 2:
+            litellm_msg = LiteLLMMessage.model_validate(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {
+                                "name": "finish",
+                                "arguments": (
+                                    '{"message": "Task complete", '
+                                    '"security_risk": "LOW"}'
+                                ),
+                            },
+                        }
+                    ],
+                }
+            )
+        # Third call: simple message to finish
+        else:
+            litellm_msg = LiteLLMMessage.model_validate(
+                {"role": "assistant", "content": "Done"}
+            )
+
+        raw_response = ModelResponse(
+            id=f"test-resp-{call_count['count']}",
+            created=int(time.time()),
+            model="test-model",
+            choices=[Choices(index=0, finish_reason="stop", message=litellm_msg)],
+        )
+
+        message = Message.from_llm_chat_message(litellm_msg)
+        metrics_snapshot = MetricsSnapshot(
+            model_name="test-model",
+            accumulated_cost=0.0,
+            max_budget_per_task=None,
+            accumulated_token_usage=None,
+        )
+
+        return LLMResponse(
+            message=message, metrics=metrics_snapshot, raw_response=raw_response
+        )
+
+    monkeypatch.setattr(
+        LLM, "completion", fake_completion_with_tool_calls, raising=True
+    )
+
+    async def fake_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        return fake_completion_with_tool_calls(self, messages, tools, **kwargs)
+
+    monkeypatch.setattr(LLM, "acompletion", fake_acompletion, raising=True)
+
+    # Create an Agent (security analyzer functionality has been deprecated and removed)
+    # Using empty tools list since tools need to be registered in the server
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test"))
+    agent = Agent(
+        llm=llm,
+        tools=[],
+    )
+
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/workspace/project"
+    )
+    conv: RemoteConversation = Conversation(agent=agent, workspace=workspace)
+
+    # Step 1: Send message WITHOUT security_risk - should still execute (defaults to
+    # UNKNOWN)
+    conv.send_message("Complete the task")
+    conv.run()
+
+    # Wait for action event - should succeed even without security_risk
+    found_action_without_risk = False
+    for attempt in range(50):  # up to ~5s
+        events = conv.state.events
+        for e in events:
+            if isinstance(e, ActionEvent) and e.tool_name == "finish":
+                # Verify it has a security risk attribute
+                assert hasattr(e, "security_risk"), (
+                    "Expected ActionEvent to have security_risk attribute"
+                )
+                found_action_without_risk = True
+                break
+        if found_action_without_risk:
+            break
+        time.sleep(0.1)
+
+    assert found_action_without_risk, (
+        "Expected to find ActionEvent with finish tool even without security_risk"
+    )
+
+    conv.close()
+
+    # The test validates that:
+    # 1. Actions can be executed without security_risk (defaults to UNKNOWN)
+    # 2. ActionEvent always has a security_risk attribute
+
+
+def test_hook_config_sent_to_server(
+    server_env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Test that hook_config is properly sent to the server and hooks are executed.
+
+    This validates the fix for the bug where hook_config was accepted by
+    RemoteConversation but never sent to the server, meaning server-side hooks
+    (PreToolUse, PostToolUse, UserPromptSubmit, Stop) were never executed.
+
+    The test:
+    1. Configures both post_tool_use and stop hooks
+    2. Uses a patched LLM that returns a finish tool call
+    3. Verifies HookExecutionEvent events are received for both hook types
+    """
+    # Create hook scripts that output JSON to indicate successful execution
+    post_tool_hook = tmp_path / "post_tool_hook.sh"
+    post_tool_hook.write_text('#!/bin/bash\necho \'{"decision": "allow"}\'\nexit 0\n')
+    post_tool_hook.chmod(0o755)
+
+    stop_hook = tmp_path / "stop_hook.sh"
+    stop_hook.write_text('#!/bin/bash\necho \'{"decision": "allow"}\'\nexit 0\n')
+    stop_hook.chmod(0o755)
+
+    hook_config = HookConfig(
+        post_tool_use=[
+            HookMatcher(
+                matcher="*",
+                hooks=[
+                    HookDefinition(
+                        command=str(post_tool_hook),
+                        timeout=5,
+                    )
+                ],
+            )
+        ],
+        stop=[
+            HookMatcher(
+                matcher="*",
+                hooks=[
+                    HookDefinition(
+                        command=str(stop_hook),
+                        timeout=5,
+                    )
+                ],
+            )
+        ],
+    )
+
+    # Create a patched LLM that returns a finish tool call to trigger hooks
+    call_count = {"count": 0}
+
+    def fake_completion_with_finish(
+        self,
+        messages,
+        tools,
+        add_security_risk_prediction=False,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        from openhands.sdk.llm.llm_response import LLMResponse
+        from openhands.sdk.llm.message import Message
+        from openhands.sdk.llm.utils.metrics import MetricsSnapshot
+
+        is_title_call = not tools
+        if not is_title_call:
+            call_count["count"] += 1
+
+        if is_title_call:
+            litellm_msg = LiteLLMMessage.model_validate(
+                {"role": "assistant", "content": "Generated title"}
+            )
+        # First agent call triggers PostToolUse and Stop hooks.
+        elif call_count["count"] == 1:
+            litellm_msg = LiteLLMMessage.model_validate(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "finish",
+                                "arguments": '{"message": "Task complete"}',
+                            },
+                        }
+                    ],
+                }
+            )
+        else:
+            # Subsequent calls: simple message
+            litellm_msg = LiteLLMMessage.model_validate(
+                {"role": "assistant", "content": "Done"}
+            )
+
+        raw_response = ModelResponse(
+            id=f"test-resp-{call_count['count']}",
+            created=int(time.time()),
+            model="test-model",
+            choices=[Choices(index=0, finish_reason="stop", message=litellm_msg)],
+        )
+
+        message = Message.from_llm_chat_message(litellm_msg)
+        metrics_snapshot = MetricsSnapshot(
+            model_name="test-model",
+            accumulated_cost=0.0,
+            max_budget_per_task=None,
+            accumulated_token_usage=None,
+        )
+
+        return LLMResponse(
+            message=message, metrics=metrics_snapshot, raw_response=raw_response
+        )
+
+    monkeypatch.setattr(LLM, "completion", fake_completion_with_finish, raising=True)
+
+    async def fake_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        return fake_completion_with_finish(self, messages, tools, **kwargs)
+
+    monkeypatch.setattr(LLM, "acompletion", fake_acompletion, raising=True)
+
+    # Create an Agent
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test"))
+    agent = Agent(llm=llm, tools=[])
+
+    # Create conversation via factory with hook_config
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/workspace/project"
+    )
+    conv: RemoteConversation = Conversation(
+        agent=agent,
+        workspace=workspace,
+        hook_config=hook_config,
+    )
+
+    # Verify the conversation was created successfully
+    assert conv._id is not None
+
+    # Send a message and run - this triggers the finish tool call
+    conv.send_message("Complete the task")
+    conv.run()
+
+    # Wait for events to be received and check for HookExecutionEvents
+    found_post_tool_use_hook = False
+    found_stop_hook = False
+    events: list[Event] = []
+
+    for attempt in range(50):  # up to ~5s
+        events = list(conv.state.events)
+        for e in events:
+            if isinstance(e, HookExecutionEvent):
+                if e.hook_event_type == "PostToolUse":
+                    found_post_tool_use_hook = True
+                    # Verify hook executed successfully
+                    assert e.success is True
+                    assert e.blocked is False
+                    assert e.exit_code == 0
+                    assert str(post_tool_hook) in e.hook_command
+                elif e.hook_event_type == "Stop":
+                    found_stop_hook = True
+                    # Verify hook executed successfully
+                    assert e.success is True
+                    assert e.blocked is False
+                    assert e.exit_code == 0
+                    assert str(stop_hook) in e.hook_command
+
+        if found_post_tool_use_hook and found_stop_hook:
+            break
+        time.sleep(0.1)
+
+    # Assert both hooks were executed and their events were received
+    assert found_post_tool_use_hook, (
+        "Expected HookExecutionEvent for PostToolUse hook. "
+        f"Events received: {[type(e).__name__ for e in events]}"
+    )
+    assert found_stop_hook, (
+        "Expected HookExecutionEvent for Stop hook. "
+        f"Events received: {[type(e).__name__ for e in events]}"
+    )
+
+    # Verify state transitions occurred (proves the conversation ran successfully)
+    state = conv.state
+    assert state.execution_status.value in {"finished", "idle", "running"}
+
+    conv.close()
+
+
+def test_subagent_definitions_forwarded_to_server(server_env, patched_llm):
+    """Agent definitions registered on the client survive the HTTP roundtrip.
+
+    This is a regression test for the bug where the server's delegate registry
+    was empty because register_builtins_agents() only ran on the client.
+
+    Validates the full flow:
+      client register_agent(description=AgentDefinition(...))
+            ( or register_agent_if_absent(...))
+        → get_registered_agent_definitions()
+        → JSON payload in POST /api/conversations
+        → server start_conversation() deserializes & re-registers
+
+    Because client and server share a process in this test, we reset the
+    global registry *after* building the payload, then POST directly to the
+    server. The server re-populates the registry from the HTTP payload (not
+    from any shared in-process state).
+    """
+    _reset_registry_for_tests()
+
+    # Register two agents with explicit definitions (file/plugin-style)
+    bash_def = AgentDefinition(
+        name="test_bash",
+        description="Command execution specialist",
+        tools=["terminal"],
+        system_prompt="You are a bash specialist.",
+    )
+    register_agent_if_absent(
+        name="test_bash",
+        factory_func=lambda llm: None,  # type: ignore[return-value]
+        description=bash_def,
+    )
+
+    reviewer_def = AgentDefinition(
+        name="test_reviewer",
+        description="Code review specialist",
+        tools=["terminal"],
+        system_prompt="You review code for correctness.",
+    )
+    register_agent(
+        name="test_reviewer",
+        factory_func=lambda llm: None,  # type: ignore[return-value]
+        description=reviewer_def,
+    )
+
+    # Verify definitions are complete before sending
+    defs = get_registered_agent_definitions()
+    reviewer = next(d for d in defs if d.name == "test_reviewer")
+    assert reviewer.tools == ["terminal"]
+    assert reviewer.system_prompt == "You review code for correctness."
+
+    # Capture serialized definitions, then reset to prove the server
+    # re-registers from the HTTP payload (not from shared in-process state).
+    all_defs = [d.model_dump(mode="json") for d in defs]
+    _reset_registry_for_tests()
+
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test"))
+    agent = Agent(llm=llm, tools=[])
+
+    # POST directly to the server with the serialized definitions
+    payload = {
+        "agent": agent.model_dump(mode="json", context={"expose_secrets": True}),
+        "workspace": {"working_dir": "/tmp/workspace/project"},
+        "agent_definitions": all_defs,
+    }
+    with httpx.Client(base_url=server_env["host"]) as client:
+        resp = client.post("/api/conversations", json=payload, timeout=10.0)
+        resp.raise_for_status()
+
+    # The server should have re-registered both agents from the HTTP payload
+    info = get_factory_info()
+    assert "test_bash" in info
+    assert "Command execution specialist" in info
+    assert "test_reviewer" in info
+    assert "Code review specialist" in info
+
+    _reset_registry_for_tests()
+
+
+def test_agent_final_response_endpoint(server_env, monkeypatch: pytest.MonkeyPatch):
+    """GET /api/conversations/{id}/agent_final_response returns the finish message.
+
+    Creates a conversation, runs the agent with a patched LLM that calls
+    ``finish(message="Task complete")``, then hits the endpoint and verifies
+    the response text.  Also checks the 404 case for an unknown conversation.
+    """
+
+    call_count = {"count": 0}
+
+    def fake_completion_with_finish(
+        self,
+        messages,
+        tools,
+        add_security_risk_prediction=False,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        from openhands.sdk.llm.llm_response import LLMResponse
+        from openhands.sdk.llm.message import Message
+        from openhands.sdk.llm.utils.metrics import MetricsSnapshot
+
+        is_title_call = not tools
+        if not is_title_call:
+            call_count["count"] += 1
+
+        if is_title_call:
+            litellm_msg = LiteLLMMessage.model_validate(
+                {"role": "assistant", "content": "Generated title"}
+            )
+        elif call_count["count"] == 1:
+            litellm_msg = LiteLLMMessage.model_validate(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "finish",
+                                "arguments": ('{"message": "Task complete"}'),
+                            },
+                        }
+                    ],
+                }
+            )
+        else:
+            litellm_msg = LiteLLMMessage.model_validate(
+                {"role": "assistant", "content": "Done"}
+            )
+
+        raw_response = ModelResponse(
+            id=f"test-resp-{call_count['count']}",
+            created=int(time.time()),
+            model="test-model",
+            choices=[Choices(index=0, finish_reason="stop", message=litellm_msg)],
+        )
+
+        message = Message.from_llm_chat_message(litellm_msg)
+        metrics_snapshot = MetricsSnapshot(
+            model_name="test-model",
+            accumulated_cost=0.0,
+            max_budget_per_task=None,
+            accumulated_token_usage=None,
+        )
+
+        return LLMResponse(
+            message=message,
+            metrics=metrics_snapshot,
+            raw_response=raw_response,
+        )
+
+    monkeypatch.setattr(LLM, "completion", fake_completion_with_finish, raising=True)
+
+    async def fake_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        return fake_completion_with_finish(self, messages, tools, **kwargs)
+
+    monkeypatch.setattr(LLM, "acompletion", fake_acompletion, raising=True)
+
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test"))
+    agent = Agent(llm=llm, tools=[])
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/workspace/project"
+    )
+    conv: RemoteConversation = Conversation(agent=agent, workspace=workspace)
+    conversation_id = conv.id
+
+    conv.send_message("Complete the task")
+    conv.run()
+
+    # Wait for the finish action event to be persisted
+    for _ in range(50):
+        events = list(conv.state.events)
+        if any(isinstance(e, ActionEvent) and e.tool_name == "finish" for e in events):
+            break
+        time.sleep(0.1)
+
+    # Hit the endpoint and verify the agent's final response
+    with httpx.Client(base_url=server_env["host"]) as client:
+        resp = client.get(
+            f"/api/conversations/{conversation_id}/agent_final_response",
+            timeout=10.0,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["response"] == "Task complete"
+
+        # 404 for unknown conversation
+        from uuid import uuid4
+
+        resp_404 = client.get(
+            f"/api/conversations/{uuid4()}/agent_final_response",
+            timeout=10.0,
+        )
+        assert resp_404.status_code == 404
+
+    conv.close()
+
+
+def test_server_info_exposes_usable_tools(server_env):
+    with httpx.Client(base_url=server_env["host"]) as client:
+        response = client.get("/server_info", timeout=10.0)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert isinstance(payload.get("usable_tools"), list)
+    assert "terminal" in payload["usable_tools"]
+
+
+def test_remote_state_exposes_invoked_skills(
+    server_env,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """End-to-end coverage for the `invoke_skill` tool on the remote agent-server.
+
+    Patches the LLM to emit an `invoke_skill(name=...)` tool call on the first
+    turn and a stop message on the second, then asserts:
+
+    1. The server records the invocation and `RemoteState.invoked_skills`
+       surfaces it through the REST response model.
+    2. The tool's ObservationEvent includes the location footer with the real
+       skill directory, proving the footer logic works through the remote
+       execution path (skill source resolves on disk server-side).
+    """
+    call_count = {"count": 0}
+
+    # Real on-disk SKILL.md so the footer resolves to a real directory.
+    skill_dir = tmp_path / "frobnitz-converter"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text("placeholder")
+
+    def fake_completion(
+        self,
+        messages,
+        tools,
+        add_security_risk_prediction=False,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        from openhands.sdk.llm.llm_response import LLMResponse
+        from openhands.sdk.llm.message import Message
+        from openhands.sdk.llm.utils.metrics import MetricsSnapshot
+
+        is_title_call = not tools
+        if not is_title_call:
+            call_count["count"] += 1
+
+        if is_title_call:
+            litellm_msg = LiteLLMMessage.model_validate(
+                {"role": "assistant", "content": "Generated title"}
+            )
+        elif call_count["count"] == 1:
+            litellm_msg = LiteLLMMessage.model_validate(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_invoke",
+                            "type": "function",
+                            "function": {
+                                "name": "invoke_skill",
+                                "arguments": '{"name": "frobnitz-converter"}',
+                            },
+                        }
+                    ],
+                }
+            )
+        else:
+            litellm_msg = LiteLLMMessage.model_validate(
+                {"role": "assistant", "content": "Done"}
+            )
+
+        raw_response = ModelResponse(
+            id=f"test-resp-{call_count['count']}",
+            created=int(time.time()),
+            model="test-model",
+            choices=[Choices(index=0, finish_reason="stop", message=litellm_msg)],
+        )
+        message = Message.from_llm_chat_message(litellm_msg)
+        metrics_snapshot = MetricsSnapshot(
+            model_name="test-model",
+            accumulated_cost=0.0,
+            max_budget_per_task=None,
+            accumulated_token_usage=None,
+        )
+        return LLMResponse(
+            message=message, metrics=metrics_snapshot, raw_response=raw_response
+        )
+
+    monkeypatch.setattr(LLM, "completion", fake_completion, raising=True)
+
+    async def fake_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        return fake_completion(self, messages, tools, **kwargs)
+
+    monkeypatch.setattr(LLM, "acompletion", fake_acompletion, raising=True)
+
+    skill = Skill(
+        name="frobnitz-converter",
+        content="Convert frobs to meters.",
+        description="Fake skill for remote-server test.",
+        source=str(skill_md),
+        is_agentskills_format=True,
+    )
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test"))
+    agent = Agent(llm=llm, tools=[], agent_context=AgentContext(skills=[skill]))
+
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/workspace/project"
+    )
+    conv: RemoteConversation = Conversation(agent=agent, workspace=workspace)
+
+    assert conv.state.invoked_skills == []
+
+    conv.send_message("Please run the frobnitz-converter skill.")
+    conv.run()
+
+    # Bust the WS-populated cache so the assertion exercises the REST
+    # `ConversationInfo` response model end-to-end.
+    conv.state.refresh_from_server()
+    assert conv.state.invoked_skills == ["frobnitz-converter"]
+    assert call_count["count"] >= 2, (
+        "Expected the agent to make a follow-up LLM call after the tool "
+        "observation, proving the invoke_skill tool actually executed."
+    )
+
+    # Find the invoke_skill ObservationEvent and confirm the footer points at
+    # the skill's real on-disk directory.
+    skill_observations = [
+        e
+        for e in conv.state.events
+        if isinstance(e, ObservationEvent) and e.tool_name == "invoke_skill"
+    ]
+    assert skill_observations, "No ObservationEvent emitted for invoke_skill"
+    obs_text = skill_observations[-1].observation.text
+    skill_dir_display = skill_dir.resolve().as_posix()
+    assert skill_dir_display in obs_text, (
+        f"Footer missing skill directory {skill_dir_display}: {obs_text!r}"
+    )
+    assert obs_text.rstrip().endswith("relative to that directory.")
+
+    conv.close()
+
+
+def test_workspace_default_llm_resolves_active_profile_despite_settings_drift(
+    tmp_path, monkeypatch
+):
+    """An unpinned automation gets the UI-advertised active named profile.
+
+    Reproduces the production drift through real HTTP endpoints: activate GLM,
+    then patch only legacy agent_settings.llm to keyless GPT while leaving the
+    active pointer untouched. RemoteWorkspace.get_llm() must resolve GLM and its
+    named-profile credential. Explicit profile selection remains an override.
+    """
+    with live_server_env(tmp_path, monkeypatch) as env:
+        with httpx.Client(base_url=env["host"], timeout=10.0) as client:
+            save_glm = client.post(
+                "/api/profiles/glm-default",
+                json={
+                    "llm": {
+                        "model": "openhands/glm-5.2",
+                        "api_key": "sk-glm-key",
+                    },
+                    "include_secrets": True,
+                },
+            )
+            assert save_glm.status_code == 201
+            assert client.post("/api/profiles/glm-default/activate").status_code == 200
+
+            save_explicit = client.post(
+                "/api/profiles/explicit-model",
+                json={
+                    "llm": {
+                        "model": "openrouter/explicit-model",
+                        "api_key": "sk-explicit-key",
+                    },
+                    "include_secrets": True,
+                },
+            )
+            assert save_explicit.status_code == 201
+
+            drift = client.patch(
+                "/api/settings",
+                json={
+                    "agent_settings_diff": {
+                        "llm": {"model": "gpt-5.5", "api_key": None}
+                    }
+                },
+            )
+            assert drift.status_code == 200
+
+            profiles = client.get("/api/profiles").json()
+            settings = client.get("/api/settings").json()
+            assert profiles["active_profile"] == "glm-default"
+            assert settings["active_profile"] == "glm-default"
+            assert settings["agent_settings"]["llm"]["model"] == "gpt-5.5"
+
+        workspace = RemoteWorkspace(
+            host=env["host"],
+            working_dir=str(env["workspace_path"]),
+        )
+        default_llm = workspace.get_llm()
+        assert default_llm.model == "openhands/glm-5.2"
+        assert default_llm.api_key is not None
+        _assert_secret(default_llm.api_key, "sk-glm-key")
+        assert default_llm.usage_id == "profile:glm-default"
+
+        # Mirrors an explicit AUTOMATION_MODEL/profile_name override.
+        explicit_llm = workspace.get_llm(profile_name="explicit-model")
+        assert explicit_llm.model == "openrouter/explicit-model"
+        assert explicit_llm.api_key is not None
+        _assert_secret(explicit_llm.api_key, "sk-explicit-key")
+        assert explicit_llm.usage_id == "profile:explicit-model"
+
+
+def test_workspace_named_llm_resolves_current_provider_credentials(
+    tmp_path, monkeypatch
+):
+    """Selecting a linked profile resolves credentials without activating it."""
+    with live_server_env(tmp_path, monkeypatch) as env:
+        workspace = RemoteWorkspace(
+            host=env["host"], working_dir=str(env["workspace_path"])
+        )
+        with httpx.Client(base_url=env["host"], timeout=10.0) as client:
+            settings_before = client.get("/api/settings").json()
+            connection = client.post(
+                "/api/llm/provider-connections",
+                json={
+                    "display_name": "Automation provider",
+                    "provider": "openai",
+                    "api_key": "sk-provider-old",
+                    "base_url": "https://provider.example/v1",
+                },
+            )
+            assert connection.status_code == 201
+            connection_id = connection.json()["id"]
+            saved = client.post(
+                "/api/profiles/automation-model",
+                json={
+                    "llm": {
+                        "model": "openai/gpt-4o-mini",
+                        "provider_connection_id": connection_id,
+                    }
+                },
+            )
+            assert saved.status_code == 201
+
+            detail = client.get("/api/profiles/automation-model").json()
+            assert detail["config"]["api_key"] is None
+            assert detail["config"]["base_url"] is None
+            assert detail["api_key_set"] is True
+
+            selected = workspace.get_llm(profile_name="automation-model")
+            assert selected.model == "openai/gpt-4o-mini"
+            assert selected.base_url == "https://provider.example/v1"
+            assert selected.api_key is not None
+            _assert_secret(selected.api_key, "sk-provider-old")
+
+            rotated = client.patch(
+                f"/api/llm/provider-connections/{connection_id}",
+                json={"api_key": "sk-provider-new"},
+            )
+            assert rotated.status_code == 200
+            selected = workspace.get_llm(profile_name="automation-model")
+            assert selected.api_key is not None
+            _assert_secret(selected.api_key, "sk-provider-new")
+
+            settings_after = client.get("/api/settings").json()
+            assert settings_after["active_profile"] == settings_before["active_profile"]
+            assert (
+                settings_after["agent_settings"]["llm"]
+                == settings_before["agent_settings"]["llm"]
+            )
+
+
+def test_settings_and_secrets_api_with_live_server(server_env):
+    """End-to-end test for settings and secrets API endpoints.
+
+    Validates the full REST API for settings and secrets management
+    through the live agent-server, including:
+    - GET/PATCH settings
+    - POST/PATCH/DELETE MCP servers
+    - GET/PUT/DELETE secrets
+    - Secret name validation
+    - Encryption/decryption round-trip
+    """
+    with httpx.Client(base_url=server_env["host"], timeout=10.0) as client:
+        # ── Test settings endpoints ────────────────────────────────────────
+        # GET settings (initial state)
+        get_resp = client.get("/api/settings")
+        assert get_resp.status_code == 200
+        initial = get_resp.json()
+        assert "agent_settings" in initial
+        assert "conversation_settings" in initial
+        assert "llm_api_key_is_set" in initial
+
+        # PATCH settings (update LLM model)
+        patch_resp = client.patch(
+            "/api/settings",
+            json={"agent_settings_diff": {"llm": {"model": "gpt-4o"}}},
+        )
+        assert patch_resp.status_code == 200
+        patched = patch_resp.json()
+        assert patched["agent_settings"]["llm"]["model"] == "gpt-4o"
+
+        create_mcp_resp = client.post(
+            "/api/settings/mcp/docs",
+            json={"transport": "http", "url": "https://docs.example/mcp"},
+        )
+        assert create_mcp_resp.status_code == 201
+
+        patch_mcp_resp = client.patch(
+            "/api/settings/mcp/docs",
+            json={"description": "Documentation"},
+        )
+        assert patch_mcp_resp.status_code == 200
+        assert (
+            patch_mcp_resp.json()["agent_settings"]["mcp_config"]["docs"]["description"]
+            == "Documentation"
+        )
+
+        delete_mcp_resp = client.delete("/api/settings/mcp/docs")
+        assert delete_mcp_resp.status_code == 200
+        assert "docs" not in delete_mcp_resp.json()["agent_settings"]["mcp_config"]
+
+        # ── Test secrets CRUD endpoints ────────────────────────────────────
+        # List secrets (should be empty initially)
+        list_resp = client.get("/api/settings/secrets")
+        assert list_resp.status_code == 200
+        assert list_resp.json()["secrets"] == []
+
+        # Create a secret
+        create_resp = client.put(
+            "/api/settings/secrets",
+            json={
+                "name": "TEST_API_KEY",
+                "value": "sk-test-live-server-12345",
+                "description": "Test API key for live server test",
+            },
+        )
+        assert create_resp.status_code == 200
+        created = create_resp.json()
+        assert created["name"] == "TEST_API_KEY"
+        assert created["description"] == "Test API key for live server test"
+
+        # List secrets again (should have one)
+        list_resp = client.get("/api/settings/secrets")
+        assert list_resp.status_code == 200
+        secrets = list_resp.json()["secrets"]
+        assert len(secrets) == 1
+        assert secrets[0]["name"] == "TEST_API_KEY"
+        # Value should NOT be returned in list
+        assert "value" not in secrets[0]
+
+        # Get secret value
+        value_resp = client.get("/api/settings/secrets/TEST_API_KEY")
+        assert value_resp.status_code == 200
+        assert value_resp.text == "sk-test-live-server-12345"
+
+        # Update the secret (upsert)
+        update_resp = client.put(
+            "/api/settings/secrets",
+            json={
+                "name": "TEST_API_KEY",
+                "value": "sk-updated-value",
+                "description": "Updated description",
+            },
+        )
+        assert update_resp.status_code == 200
+
+        # Verify updated value
+        value_resp = client.get("/api/settings/secrets/TEST_API_KEY")
+        assert value_resp.status_code == 200
+        assert value_resp.text == "sk-updated-value"
+
+        invalid_update_resp = client.put(
+            "/api/settings/secrets",
+            json={
+                "name": "TEST_API_KEY",
+                "value": REDACTED_SECRET_VALUE,
+                "description": "Must not persist",
+            },
+        )
+        assert invalid_update_resp.status_code == 422
+        value_resp = client.get("/api/settings/secrets/TEST_API_KEY")
+        assert value_resp.status_code == 200
+        assert value_resp.text == "sk-updated-value"
+
+        invalid_create_resp = client.put(
+            "/api/settings/secrets",
+            json={"name": "EMPTY_SECRET", "value": ""},
+        )
+        assert invalid_create_resp.status_code == 422
+        listed_names = {
+            item["name"]
+            for item in client.get("/api/settings/secrets").json()["secrets"]
+        }
+        assert "EMPTY_SECRET" not in listed_names
+
+        # Create another secret
+        client.put(
+            "/api/settings/secrets",
+            json={"name": "ANOTHER_SECRET", "value": "another-value"},
+        )
+        list_resp = client.get("/api/settings/secrets")
+        assert len(list_resp.json()["secrets"]) == 2
+
+        # Delete one secret
+        delete_resp = client.delete("/api/settings/secrets/TEST_API_KEY")
+        assert delete_resp.status_code == 200
+        assert delete_resp.json()["deleted"] is True
+
+        # Verify deleted
+        get_deleted_resp = client.get("/api/settings/secrets/TEST_API_KEY")
+        assert get_deleted_resp.status_code == 404
+
+        # ── Test secret name validation ────────────────────────────────────
+        # Invalid name: starts with number
+        invalid_resp = client.put(
+            "/api/settings/secrets",
+            json={"name": "123_invalid", "value": "test"},
+        )
+        assert invalid_resp.status_code == 422
+
+        # Invalid name: contains special characters
+        invalid_resp = client.put(
+            "/api/settings/secrets",
+            json={"name": "invalid-name", "value": "test"},
+        )
+        assert invalid_resp.status_code == 422
+
+        # ── Test settings with encrypted secrets ───────────────────────────
+        # Update LLM API key
+        patch_resp = client.patch(
+            "/api/settings",
+            json={"agent_settings_diff": {"llm": {"api_key": "sk-live-test-key"}}},
+        )
+        assert patch_resp.status_code == 200
+        assert patch_resp.json()["llm_api_key_is_set"] is True
+        # Response should redact the key (no X-Expose-Secrets header)
+        assert patch_resp.json()["agent_settings"]["llm"]["api_key"] == "**********"
+
+        # Cleanup
+        client.delete("/api/settings/secrets/ANOTHER_SECRET")
+
+
+def test_interrupt_endpoint_cancels_running_conversation(
+    server_env, monkeypatch: pytest.MonkeyPatch
+):
+    """POST /{conversation_id}/interrupt cancels a running arun() task.
+
+    Uses a slow LLM (blocking sleep during completion) so the conversation
+    stays in RUNNING long enough for the interrupt request to arrive.
+    Verifies the conversation transitions to PAUSED with an InterruptEvent.
+    """
+    import asyncio
+
+    slow_delay = 10  # seconds — long enough to guarantee interrupt lands
+
+    def slow_completion(
+        self,
+        messages,
+        tools,
+        add_security_risk_prediction=False,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        # Block in a way that arun() can cancel the awaiting coroutine.
+        time.sleep(slow_delay)
+        # Should never reach here if interrupt arrives in time.
+        from openhands.sdk.llm.llm_response import LLMResponse
+        from openhands.sdk.llm.message import Message
+        from openhands.sdk.llm.utils.metrics import MetricsSnapshot
+
+        litellm_msg = LiteLLMMessage.model_validate(
+            {"role": "assistant", "content": "Hello"}
+        )
+        return LLMResponse(
+            message=Message.from_llm_chat_message(litellm_msg),
+            metrics=MetricsSnapshot(
+                model_name="test-model",
+                accumulated_cost=0.0,
+                max_budget_per_task=None,
+                accumulated_token_usage=None,
+            ),
+            raw_response=ModelResponse(
+                id="test-resp",
+                created=int(time.time()),
+                model="test-model",
+                choices=[Choices(index=0, finish_reason="stop", message=litellm_msg)],
+            ),
+        )
+
+    monkeypatch.setattr(LLM, "completion", slow_completion, raising=True)
+
+    async def slow_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        # Use asyncio.sleep so CancelledError interrupts instantly.
+        await asyncio.sleep(slow_delay)
+        return slow_completion(self, messages, tools, **kwargs)
+
+    monkeypatch.setattr(LLM, "acompletion", slow_acompletion, raising=True)
+
+    host = server_env["host"]
+
+    with httpx.Client(base_url=host, timeout=15.0) as client:
+        # 1. Create a conversation
+        create_resp = client.post(
+            "/api/conversations",
+            json={
+                "agent": {
+                    "llm": {"model": "gpt-4o-mini", "api_key": "test"},
+                    "tools": [],
+                },
+                "workspace": {"working_dir": "/tmp/workspace/project"},
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        conv_id = create_resp.json()["id"]
+
+        # 2. Send a message (without auto-run)
+        msg_resp = client.post(
+            f"/api/conversations/{conv_id}/events",
+            json={
+                "content": [{"type": "text", "text": "Do something"}],
+                "run": False,
+            },
+        )
+        assert msg_resp.status_code == 200, msg_resp.text
+
+        # 3. Start the run — this triggers arun() with the slow LLM
+        run_resp = client.post(f"/api/conversations/{conv_id}/run")
+        assert run_resp.status_code == 200, run_resp.text
+
+        # 4. Wait briefly for the run to actually start
+        status_resp = client.get(f"/api/conversations/{conv_id}")
+        for _ in range(20):
+            status_resp = client.get(f"/api/conversations/{conv_id}")
+            if status_resp.json().get("execution_status") == "running":
+                break
+            time.sleep(0.1)
+        assert status_resp.json()["execution_status"] == "running", (
+            f"Conversation did not reach RUNNING: {status_resp.json()}"
+        )
+
+        # 5. Interrupt!
+        interrupt_resp = client.post(f"/api/conversations/{conv_id}/interrupt")
+        assert interrupt_resp.status_code == 200, interrupt_resp.text
+
+        # 6. Verify the conversation transitions to PAUSED
+        for _ in range(50):
+            status_resp = client.get(f"/api/conversations/{conv_id}")
+            if status_resp.json().get("execution_status") == "paused":
+                break
+            time.sleep(0.1)
+        assert status_resp.json()["execution_status"] == "paused", (
+            f"Expected PAUSED after interrupt, got: {status_resp.json()}"
+        )
+
+        # 7. Verify an InterruptEvent was emitted
+        events_resp = client.get(
+            f"/api/conversations/{conv_id}/events/search",
+            params={
+                "kind": ("openhands.sdk.event.user_action.InterruptEvent"),
+            },
+        )
+        assert events_resp.status_code == 200
+        items = events_resp.json()["items"]
+        assert len(items) >= 1, f"Expected at least one InterruptEvent, got: {items}"
+
+
+@pytest.mark.parametrize(
+    ("lock_file", "method", "path", "payload", "expected_status"),
+    [
+        ("profiles/.profiles.lock", "GET", "/v1/models", None, 200),
+        (
+            "profiles/.profiles.lock",
+            "PATCH",
+            "/api/settings",
+            {"active_profile": "qa-missing"},
+            404,
+        ),
+        (
+            "agent-profiles/.agent-profiles.lock",
+            "GET",
+            "/api/settings/secrets?agent_profile_id=qa-missing",
+            None,
+            404,
+        ),
+    ],
+)
+def test_profile_store_consumers_keep_live_server_responsive(
+    server_env, tmp_path, lock_file, method, path, payload, expected_status
+):
+    lock_path = tmp_path / ".openhands" / lock_file
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    held = FileLock(lock_path, thread_local=False)
+    held.acquire()
+    safety = threading.Timer(5.0, held.release)
+    safety.start()
+    try:
+        with (
+            httpx.Client(base_url=server_env["host"], timeout=10) as client,
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            waiting = executor.submit(client.request, method, path, json=payload)
+            time.sleep(0.3)
+            started = time.monotonic()
+            alive = client.get("/alive")
+            assert alive.status_code == 200
+            assert time.monotonic() - started < 2.0
+            assert not waiting.done()
+            held.release()
+            response = waiting.result(timeout=5)
+            assert response.status_code == expected_status, response.text
+    finally:
+        safety.cancel()
+        held.release(force=True)
+
+
+def test_secret_masked_timestamp_cursor_with_live_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    year = datetime.now().year
+    # Events are stamped in the next year if the test runs across New Year.
+    secrets = {"YEAR": str(year), "NEXT_YEAR": str(year + 1)}
+    target = tmp_path / "synthetic.txt"
+    target.write_text(f"synthetic content {year}")
+    scripted = TestLLM.from_messages(
+        [
+            Message(
+                role="assistant",
+                tool_calls=[
+                    MessageToolCall(
+                        id="call-view",
+                        name=FileEditorTool.name,
+                        arguments=json.dumps({"command": "view", "path": str(target)}),
+                        origin="completion",
+                    )
+                ],
+            ),
+            Message(
+                role="assistant",
+                tool_calls=[
+                    MessageToolCall(
+                        id="call-finish",
+                        name="finish",
+                        arguments='{"message": "done"}',
+                        origin="completion",
+                    )
+                ],
+            ),
+        ],
+        model="gpt-4o-mini",
+    )
+
+    async def acompletion(self, messages, tools=None, **kwargs):
+        return await scripted.acompletion(messages, tools=tools, **kwargs)
+
+    def completion(self, messages, **kwargs):
+        return TestLLM.from_messages(
+            [Message(role="assistant", content=[TextContent(text="Timestamp test")])]
+        ).completion(messages, **kwargs)
+
+    monkeypatch.setattr(LLM, "completion", completion)
+    monkeypatch.setattr(LLM, "acompletion", acompletion)
+    with live_server_env(tmp_path / "server", monkeypatch) as env:
+        workspace = RemoteWorkspace(
+            host=env["host"], working_dir=str(env["workspace_path"])
+        )
+        agent = Agent(
+            llm=LLM(model="gpt-4o-mini", api_key=SecretStr("unused")),
+            tools=[Tool(name=FileEditorTool.name)],
+        )
+        conversation = Conversation(
+            agent=agent,
+            workspace=workspace,
+            visualizer=None,
+            secrets=secrets,
+            delete_on_close=False,
+        )
+        try:
+            conversation.set_security_analyzer(LLMSecurityAnalyzer())
+            conversation.send_message("Read the synthetic file and finish.")
+            conversation.run()
+            endpoint = f"/api/conversations/{conversation.id}/events/search"
+            with httpx.Client(base_url=env["host"], trust_env=False) as client:
+                response = client.get(endpoint, params={"sort_order": "TIMESTAMP_DESC"})
+                assert response.status_code == 200, response.text
+                items = response.json()["items"]
+                analysis = next(
+                    i for i in items if i["kind"] == "SecurityAnalysisEvent"
+                )
+                cursor = analysis["timestamp"]
+                older = client.get(endpoint, params={"timestamp__lt": cursor})
+                assert older.status_code == 200, older.text
+                newer = client.get(endpoint, params={"timestamp__gte": cursor})
+                assert newer.status_code == 200, newer.text
+                assert older.json()["items"]
+                assert newer.json()["items"]
+                assert all(i["timestamp"] < cursor for i in older.json()["items"])
+                assert all(i["timestamp"] >= cursor for i in newer.json()["items"])
+                assert {i["id"] for i in items} == {
+                    i["id"] for i in older.json()["items"] + newer.json()["items"]
+                }
+                for item in items:
+                    datetime.fromisoformat(item["timestamp"])
+                observations = [i for i in items if i["kind"] == "ObservationEvent"]
+                assert any("<secret-hidden>" in json.dumps(i) for i in observations)
+
+        finally:
+            conversation.close()
+
+        event_paths = list((tmp_path / "server").rglob("events/*.json"))
+        (analysis_path,) = [
+            p for p in event_paths if json.loads(p.read_text())["id"] == analysis["id"]
+        ]
+        stored = json.loads(analysis_path.read_text())
+        assert stored["timestamp"] == cursor
+        assert cursor[:4] in secrets.values()
+        log = EventLog(LocalFileStore(str(analysis_path.parent.parent)))
+        restored = log[log.get_index(analysis["id"])]
+        assert isinstance(restored, SecurityAnalysisEvent)
+        assert restored.timestamp == cursor
+
+
+def test_max_budget_per_run_set_updated_and_cleared_over_live_server(
+    server_env, monkeypatch: pytest.MonkeyPatch
+):
+    """The budget set at creation and changed via PATCH governs the live run."""
+    from openhands.sdk.conversation.exceptions import ConversationRunError
+    from openhands.sdk.llm.llm_response import LLMResponse
+
+    llm_calls = 0
+
+    def fake_completion_costing_one_dollar(
+        self, messages, tools, add_security_risk_prediction=False, **kwargs
+    ):  # type: ignore[no-untyped-def]
+        nonlocal llm_calls
+        llm_calls += 1
+        # A think call never finishes the run, so only a limit can stop it.
+        litellm_msg = LiteLLMMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"call_think_{llm_calls}",
+                        "type": "function",
+                        "function": {
+                            "name": "think",
+                            "arguments": '{"thought": "still working"}',
+                        },
+                    }
+                ],
+            }
+        )
+        raw_response = ModelResponse(
+            id=f"resp-{llm_calls}",
+            created=int(time.time()),
+            model="test-model",
+            choices=[Choices(index=0, finish_reason="stop", message=litellm_msg)],
+        )
+        self.metrics.add_cost(1.0)
+        return LLMResponse(
+            message=Message.from_llm_chat_message(litellm_msg),
+            metrics=self.metrics.get_snapshot(),
+            raw_response=raw_response,
+        )
+
+    async def fake_acompletion(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        return fake_completion_costing_one_dollar(self, messages, tools, **kwargs)
+
+    monkeypatch.setattr(
+        LLM, "completion", fake_completion_costing_one_dollar, raising=True
+    )
+    monkeypatch.setattr(LLM, "acompletion", fake_acompletion, raising=True)
+
+    agent = Agent(llm=LLM(model="gpt-4o-mini", api_key=SecretStr("test")), tools=[])
+    workspace = RemoteWorkspace(
+        host=server_env["host"], working_dir="/tmp/workspace/project"
+    )
+    conv: RemoteConversation = Conversation(
+        agent=agent,
+        workspace=workspace,
+        max_iteration_per_run=12,
+        max_budget_per_run=2.5,
+        stuck_detection=False,
+    )
+    url = f"{server_env['host']}/api/conversations/{conv.id}"
+
+    def run_and_get_error_code() -> str:
+        conv.send_message("keep going")
+        with pytest.raises(ConversationRunError) as exc_info:
+            conv.run(poll_interval=0.1, timeout=60)
+        assert exc_info.value.conversation_error is not None
+        return exc_info.value.conversation_error.code
+
+    try:
+        with httpx.Client(timeout=10) as client:
+            assert client.get(url).json()["max_budget_per_run"] == 2.5
+
+            assert run_and_get_error_code() == "MaxBudgetReached"
+            assert llm_calls == 3
+
+            for invalid in (0, -1):
+                resp = client.patch(url, json={"max_budget_per_run": invalid})
+                assert resp.status_code == 422
+
+            # Omitting the field leaves the budget untouched.
+            assert client.patch(url, json={"title": "renamed"}).status_code == 200
+            assert client.get(url).json()["max_budget_per_run"] == 2.5
+
+            resp = client.patch(url, json={"max_budget_per_run": 6})
+            assert resp.status_code == 200
+            assert client.get(url).json()["max_budget_per_run"] == 6
+            assert run_and_get_error_code() == "MaxBudgetReached"
+            assert llm_calls == 6
+
+            resp = client.patch(url, json={"max_budget_per_run": None})
+            assert resp.status_code == 200
+            assert client.get(url).json()["max_budget_per_run"] is None
+            assert run_and_get_error_code() == "MaxIterationsReached"
+            assert llm_calls == 18
+    finally:
+        conv.close()

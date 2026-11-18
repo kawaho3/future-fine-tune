@@ -1,0 +1,710 @@
+import json
+import math
+import os
+import time
+import traceback
+import uuid
+import warnings
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, ClassVar, Self
+
+from litellm.cost_calculator import completion_cost as litellm_completion_cost
+from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
+from litellm.types.utils import Choices, CostPerToken, ModelResponse, Usage
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    TypeAdapter,
+    model_validator,
+)
+
+from openhands.sdk.llm.utils.litellm_provider import LLMProvider
+from openhands.sdk.llm.utils.metrics import Metrics
+from openhands.sdk.llm.utils.openhands_provider import litellm_call_kwargs
+from openhands.sdk.logger import get_logger
+from openhands.sdk.utils.deprecation import warn_deprecated
+from openhands.sdk.utils.redact import is_secret_key, redact_text_secrets, sanitize_dict
+
+
+logger = get_logger(__name__)
+
+
+def _reported_cost(value: object) -> float | None:
+    """Accept finite nonnegative charges, including numeric HTTP header strings."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        cost = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return cost if math.isfinite(cost) and cost >= 0 else None
+
+
+@dataclass(frozen=True, slots=True)
+class UsageSnapshot:
+    """Provider-independent view of one response's token accounting.
+
+    LiteLLM reports usage in two disjoint shapes that name the same quantities
+    differently: ``Usage`` (Chat Completions) uses ``prompt_tokens`` /
+    ``completion_tokens``, while ``ResponseAPIUsage`` (Responses API) uses
+    ``input_tokens`` / ``output_tokens``. Normalizing once, at the boundary,
+    keeps every consumer -- metrics, span attributes and completion logs -- on
+    a single vocabulary instead of rediscovering the aliases at each call site.
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+    @property
+    def has_tokens(self) -> bool:
+        """Whether the provider reported any prompt or completion tokens."""
+        return self.prompt_tokens > 0 or self.completion_tokens > 0
+
+
+def normalize_usage(usage: Usage | ResponseAPIUsage | None) -> UsageSnapshot | None:
+    """Return a :class:`UsageSnapshot` for either provider usage shape.
+
+    ``None`` means "no token accounting": the provider reported no usage, or
+    reported a shape this module does not recognize. Unrecognized shapes are
+    ignored rather than guessed at, so adding a provider cannot silently feed
+    invented token counts into cost and cache accounting.
+    """
+    if isinstance(usage, Usage):
+        prompt_details = usage.prompt_tokens_details
+        completion_details = usage.completion_tokens_details
+        # ``cache_creation_tokens`` defaults to ``None``, so presence in
+        # ``model_fields_set`` is what distinguishes "provider reported a cache
+        # write" from "provider said nothing about cache writes". litellm,
+        # however, deletes the attribute from the instance when the value is
+        # ``None`` (e.g. minimax-m3 reports ``cache_creation_tokens: null``),
+        # so ``model_fields_set`` alone is insufficient; guard with ``hasattr``.
+        cache_write = 0
+        if (
+            prompt_details is not None
+            and "cache_creation_tokens" in prompt_details.model_fields_set
+            and hasattr(prompt_details, "cache_creation_tokens")
+        ):
+            cache_write = int(prompt_details.cache_creation_tokens or 0)
+        return UsageSnapshot(
+            prompt_tokens=int(usage.prompt_tokens or 0),
+            completion_tokens=int(usage.completion_tokens or 0),
+            reasoning_tokens=(
+                int(completion_details.reasoning_tokens or 0)
+                if completion_details is not None
+                else 0
+            ),
+            cache_read_tokens=(
+                int(prompt_details.cached_tokens or 0)
+                if prompt_details is not None
+                else 0
+            ),
+            cache_write_tokens=cache_write,
+        )
+
+    if isinstance(usage, ResponseAPIUsage):
+        input_details = usage.input_tokens_details
+        output_details = usage.output_tokens_details
+        return UsageSnapshot(
+            prompt_tokens=int(usage.input_tokens or 0),
+            completion_tokens=int(usage.output_tokens or 0),
+            reasoning_tokens=(
+                int(output_details.reasoning_tokens or 0)
+                if output_details is not None
+                else 0
+            ),
+            cache_read_tokens=(
+                int(input_details.cached_tokens or 0)
+                if input_details is not None
+                else 0
+            ),
+        )
+
+    return None
+
+
+def _response_usage(
+    resp: ModelResponse | ResponsesAPIResponse,
+) -> Usage | ResponseAPIUsage | None:
+    """Return the usage object a response carries, if any.
+
+    ``ResponsesAPIResponse`` declares ``usage`` as a field. ``ModelResponse``
+    only accepts it as a constructor argument, so pydantic keeps it in the
+    model's extra mapping instead of its fields; reading that mapping is the
+    typed equivalent of probing for a possibly-absent attribute.
+    """
+    if isinstance(resp, ResponsesAPIResponse):
+        return resp.usage
+    if isinstance(resp, ModelResponse):
+        extra = resp.model_extra
+        if not extra:
+            return None
+        usage = extra.get("usage")
+        if isinstance(usage, (Usage, ResponseAPIUsage)):
+            return usage
+    return None
+
+
+class Telemetry(BaseModel):
+    """
+    Handles latency, token/cost accounting, and optional logging.
+    All runtime state (like start times) lives in private attrs.
+    """
+
+    # --- Config fields ---
+    model_name: str = Field(default="unknown", description="Name of the LLM model")
+    completion_logging_enabled: bool = Field(
+        default=False,
+        description="Enable completion JSON logging to log_dir or the configured "
+        "completion-log callback. OpenTelemetry tracing is configured separately "
+        "and can export LLM message content while completion logging is "
+        "disabled.",
+    )
+    log_enabled: bool = Field(
+        default=False,
+        description="Deprecated alias for completion_logging_enabled. "
+        "Deprecated since v1.63.0 and scheduled for removal in v1.68.0.",
+        deprecated=True,
+    )
+    log_dir: str | None = Field(
+        default=None, description="Directory to write logs if enabled"
+    )
+    input_cost_per_token: float | None = Field(
+        default=None, ge=0, description="Custom Input cost per token (USD)"
+    )
+    output_cost_per_token: float | None = Field(
+        default=None, ge=0, description="Custom Output cost per token (USD)"
+    )
+
+    metrics: Metrics = Field(..., description="Metrics collector instance")
+
+    # --- Runtime fields (not serialized) ---
+    _req_start: float = PrivateAttr(default=0.0)
+    _req_ctx: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _last_latency: float = PrivateAttr(default=0.0)
+    _log_completions_callback: Callable[[str, str], None] | None = PrivateAttr(
+        default=None
+    )
+    _stats_update_callback: Callable[[], None] | None = PrivateAttr(default=None)
+    _span_cm: Any = PrivateAttr(default=None)
+    _span: Any = PrivateAttr(default=None)
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        extra="forbid", arbitrary_types_allowed=True
+    )
+
+    @staticmethod
+    def _normalize_log_enabled_alias(data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        if "log_enabled" in normalized:
+            old_value = TypeAdapter(bool).validate_python(normalized["log_enabled"])
+            if "completion_logging_enabled" in normalized:
+                new_value = TypeAdapter(bool).validate_python(
+                    normalized["completion_logging_enabled"]
+                )
+                if old_value != new_value:
+                    raise ValueError(
+                        "Conflicting values for log_enabled (deprecated) and "
+                        "completion_logging_enabled: pass only "
+                        "completion_logging_enabled."
+                    )
+            else:
+                normalized["completion_logging_enabled"] = old_value
+                warn_deprecated(
+                    "Telemetry(log_enabled=...)",
+                    deprecated_in="1.63.0",
+                    removed_in="1.68.0",
+                    details="Use completion_logging_enabled instead.",
+                    stacklevel=4,
+                )
+        if "completion_logging_enabled" in normalized:
+            normalized["log_enabled"] = normalized["completion_logging_enabled"]
+        return normalized
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_log_enabled_alias(cls, data: Any) -> Any:
+        return cls._normalize_log_enabled_alias(data)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in ("log_enabled", "completion_logging_enabled"):
+            if name == "log_enabled":
+                warn_deprecated(
+                    "Telemetry.log_enabled assignment",
+                    deprecated_in="1.63.0",
+                    removed_in="1.68.0",
+                    details="Use completion_logging_enabled instead.",
+                    stacklevel=3,
+                )
+            super().__setattr__("completion_logging_enabled", value)
+            super().__setattr__("log_enabled", value)
+            return
+        super().__setattr__(name, value)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        normalized = (
+            self._normalize_log_enabled_alias(dict(update))
+            if update is not None
+            else None
+        )
+        copied = super().model_copy(update=normalized, deep=deep)
+        # Each copy owns its request span, even while the original is active.
+        copied._span = None
+        copied._span_cm = None
+        copied._req_ctx = {}
+        copied._req_start = 0.0
+        return copied
+
+    # ---------- Lifecycle ----------
+    def set_log_completions_callback(
+        self, callback: Callable[[str, str], None] | None
+    ) -> None:
+        """Set a callback function for logging instead of writing to file.
+
+        Args:
+            callback: A function that takes (filename, log_data) and handles the log.
+                     Used for streaming logs in remote execution contexts.
+        """
+        self._log_completions_callback = callback
+
+    def set_stats_update_callback(self, callback: Callable[[], None] | None) -> None:
+        """Set a callback function to be notified when stats are updated.
+
+        Args:
+            callback: A function called whenever metrics are updated.
+                     Used for streaming stats updates in remote execution contexts.
+        """
+        self._stats_update_callback = callback
+
+    def notify_stats_update(self) -> None:
+        """Tell the stats-update callback, if any, that the metrics changed."""
+        if self._stats_update_callback is None:
+            return
+        try:
+            self._stats_update_callback()
+        except Exception:
+            logger.exception("Stats update callback failed", exc_info=True)
+
+    def on_request(self, telemetry_ctx: dict | None) -> None:
+        self._req_start = time.time()
+        self._req_ctx = _redact_request_credentials(telemetry_ctx or {})
+        # Span lifecycle and content annotation are controlled by whether an OTel
+        # exporter is configured (see openhands.sdk.observability), independently
+        # of completion_logging_enabled.
+        self._open_span()
+        self._annotate_span_messages("input", lambda: _request_messages(self._req_ctx))
+
+    def on_response(
+        self,
+        resp: ModelResponse | ResponsesAPIResponse,
+        raw_resp: ModelResponse | None = None,
+        provider_info: LLMProvider | None = None,
+    ) -> Metrics:
+        """
+        Side-effects:
+          - records latency, tokens, cost into Metrics
+          - optionally writes a JSON log file
+        """
+        # 1) latency
+        self._last_latency = time.time() - (self._req_start or time.time())
+        response_id = resp.id
+        self.metrics.add_response_latency(
+            self._last_latency, response_id, model_name=self.model_name
+        )
+
+        # 2) cost
+        cost = self._compute_cost(resp, provider_info=provider_info)
+        # A confirmed zero charge is different from unavailable pricing.
+        if cost is not None:
+            self.metrics.add_cost(cost, model_name=self.model_name)
+
+        # 3) tokens - normalize the provider's usage shape exactly once
+        usage = normalize_usage(_response_usage(resp))
+
+        if usage is not None and usage.has_tokens:
+            self._record_usage(
+                usage, response_id, self._req_ctx.get("context_window", 0)
+            )
+
+        # 4) optional logging
+        if self.completion_logging_enabled:
+            self.log_llm_call(resp, cost, raw_resp=raw_resp)
+
+        # 5) authoritative cost + cache buckets onto the span, before it closes
+        self._annotate_span_messages("output", lambda: _response_messages(resp))
+        self._annotate_span(cost, usage)
+        self._close_span()
+
+        # 6) notify about stats update
+        self.notify_stats_update()
+
+        return self.metrics.deep_copy()
+
+    def on_error(self, _err: BaseException) -> None:
+        # Best-effort logging for failed requests (so we can debug malformed
+        # request payloads, e.g. orphaned Responses reasoning items).
+        self._last_latency = time.time() - (self._req_start or time.time())
+        self._close_span(_err)
+
+        if not self.completion_logging_enabled:
+            return
+        if not self.log_dir and not self._log_completions_callback:
+            return
+
+        try:
+            filename = (
+                f"{self.model_name.replace('/', '__')}-"
+                f"{time.time():.3f}-"
+                f"{uuid.uuid4().hex[:4]}-error.json"
+            )
+
+            data = self._req_ctx.copy()
+            data["error"] = {
+                "type": type(_err).__name__,
+                "message": redact_text_secrets(str(_err)),
+                "repr": redact_text_secrets(repr(_err)),
+                "traceback": redact_text_secrets(
+                    "".join(
+                        traceback.format_exception(type(_err), _err, _err.__traceback__)
+                    )
+                ),
+            }
+            data["timestamp"] = time.time()
+            data["latency_sec"] = self._last_latency
+            data["cost"] = 0.0
+
+            log_data = json.dumps(data, default=_safe_json, ensure_ascii=False)
+
+            if self._log_completions_callback:
+                self._log_completions_callback(filename, log_data)
+            elif self.log_dir:
+                os.makedirs(self.log_dir, exist_ok=True)
+                fname = os.path.join(self.log_dir, filename)
+                with open(fname, "w", encoding="utf-8") as f:
+                    f.write(log_data)
+        except Exception as e:
+            warnings.warn(f"Telemetry error logging failed: {e}")
+        return
+
+    # ---------- Helpers ----------
+    def _record_usage(
+        self, usage: UsageSnapshot, response_id: str, context_window: int
+    ) -> None:
+        """Record an already-normalized usage snapshot into ``metrics``."""
+        self.metrics.add_token_usage(
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            context_window=context_window,
+            response_id=response_id,
+            model_name=self.model_name,
+        )
+
+    # ---------- Observability span ----------
+    # These bracket one LLM call: ``on_request`` -> transport -> ``on_response``
+    # all run inside a single retry attempt, so the span is current while
+    # litellm executes and still open when the cost is known.
+    def _open_span(self) -> None:
+        self._close_span()  # a retry re-enters on_request; never leak the old one
+        try:
+            # Imported lazily: openhands.sdk.observability pulls in
+            # openhands.sdk.event, which imports this module.
+            from openhands.sdk.observability.laminar import llm_call_span
+
+            cm = llm_call_span(f"llm.{self.model_name}")
+            self._span = cm.__enter__()
+            self._span_cm = cm
+        except Exception:
+            logger.debug("Failed to open LLM span", exc_info=True)
+            self._span = self._span_cm = None
+
+    def _annotate_span(self, cost: float | None, usage: UsageSnapshot | None) -> None:
+        span = self._span
+        if span is None:
+            return
+        try:
+            if cost is not None:
+                # Authoritative: _compute_cost prefers the proxy's
+                # x-litellm-response-cost header, which is already cache-aware
+                # and priced by the real backend rather than by a name lookup.
+                span.set_attribute("gen_ai.usage.cost", float(cost))
+            if usage is not None and usage.has_tokens:
+                span.set_attribute("gen_ai.usage.input_tokens", usage.prompt_tokens)
+                span.set_attribute(
+                    "gen_ai.usage.output_tokens", usage.completion_tokens
+                )
+            if usage is not None:
+                # Emitted unconditionally: lmnr only reports these when
+                # prompt_tokens_details is populated, which not every provider
+                # shape does.
+                span.set_attribute(
+                    "gen_ai.usage.cache_read_input_tokens", usage.cache_read_tokens
+                )
+                span.set_attribute(
+                    "gen_ai.usage.cache_creation_input_tokens",
+                    usage.cache_write_tokens,
+                )
+        except Exception:
+            logger.debug("Failed to annotate LLM span", exc_info=True)
+
+    def _annotate_span_messages(
+        self, direction: str, messages: Callable[[], list[Any]]
+    ) -> None:
+        span = self._span
+        if span is None:
+            return
+        try:
+            serializable = json.loads(json.dumps(messages(), default=_safe_json))
+            payload = redact_text_secrets(
+                json.dumps(_without_reasoning(serializable), ensure_ascii=False)
+            )
+            span.set_attribute(f"gen_ai.{direction}.messages", payload)
+            span.set_attribute(f"lmnr.span.{direction}", payload)
+        except Exception:
+            logger.debug("Failed to annotate LLM span messages", exc_info=True)
+
+    def _close_span(self, err: BaseException | None = None) -> None:
+        cm, self._span_cm, self._span = self._span_cm, None, None
+        if cm is None:
+            return
+        try:
+            if err is not None:
+                cm.__exit__(type(err), err, err.__traceback__)
+            else:
+                cm.__exit__(None, None, None)
+        except Exception:
+            logger.debug("Failed to close LLM span", exc_info=True)
+
+    def _compute_cost(
+        self,
+        resp: ModelResponse | ResponsesAPIResponse,
+        provider_info: LLMProvider | None = None,
+    ) -> float | None:
+        """Try provider header, reported usage, then pricing; None is unavailable."""
+        extra_kwargs = {}
+        if (
+            self.input_cost_per_token is not None
+            and self.output_cost_per_token is not None
+        ):
+            cost_per_token = CostPerToken(
+                input_cost_per_token=self.input_cost_per_token,
+                output_cost_per_token=self.output_cost_per_token,
+            )
+            logger.debug(f"Using custom cost per token: {cost_per_token}")
+            extra_kwargs["custom_cost_per_token"] = cost_per_token
+
+        try:
+            hidden = resp._hidden_params or {}
+            headers = hidden.get("additional_headers", {})
+            header_name = "llm_provider-x-litellm-response-cost"
+            if header_name in headers:
+                cost = _reported_cost(headers[header_name])
+                if cost is not None:
+                    return cost
+                logger.debug(
+                    "Failed to get cost from LiteLLM headers: "
+                    "invalid response cost value"
+                )
+        except Exception as e:
+            logger.debug(f"Failed to get cost from LiteLLM headers: {e}")
+
+        # Final usage can contain a charge for an alias absent from the static
+        # price map. Select one total, never add header and usage copies. Explicit
+        # token rates remain an intentional pricing override when no header exists.
+        if "custom_cost_per_token" not in extra_kwargs:
+            usage = _response_usage(resp)
+            # Read the typed field directly, without serializing all token details.
+            # LiteLLM deletes absent optional Usage attributes after construction.
+            try:
+                cost = _reported_cost(usage.cost) if usage is not None else None
+            except AttributeError:
+                cost = None
+            # Zero usage can be a gateway's unavailable-price placeholder. Keep
+            # existing static pricing in that case; explicit zero headers above
+            # remain authoritative. This fallback repairs positive charges only.
+            if cost is not None and cost > 0:
+                return cost
+
+        if provider_info is None:
+            call_kwargs = litellm_call_kwargs(self.model_name, None)
+            provider_info = LLMProvider.from_model(
+                model=call_kwargs["model"],
+                api_base=call_kwargs["api_base"],
+            )
+        extra_kwargs.update(provider_info.as_litellm_call_kwargs())
+        try:
+            return float(
+                litellm_completion_cost(completion_response=resp, **extra_kwargs)
+            )
+        except Exception as e:
+            warnings.warn(f"Cost calculation failed: {e}")
+            return None
+
+    def log_llm_call(
+        self,
+        resp: ModelResponse | ResponsesAPIResponse,
+        cost: float | None,
+        raw_resp: ModelResponse | ResponsesAPIResponse | None = None,
+    ) -> None:
+        # Skip if neither file logging nor callback is configured
+        if not self.log_dir and not self._log_completions_callback:
+            return
+        try:
+            # Prepare filename and log data
+            filename = (
+                f"{self.model_name.replace('/', '__')}-"
+                f"{time.time():.3f}-"
+                f"{uuid.uuid4().hex[:4]}.json"
+            )
+
+            data = self._req_ctx.copy()
+            data["response"] = (
+                resp  # ModelResponse | ResponsesAPIResponse;
+                # serialized via _safe_json
+            )
+            data["cost"] = float(cost or 0.0)
+            data["timestamp"] = time.time()
+            data["latency_sec"] = self._last_latency
+
+            # Usage summary (prompt, completion, reasoning tokens) for quick inspection
+            try:
+                usage = normalize_usage(_response_usage(resp))
+                if usage is not None:
+                    data["usage_summary"] = {
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens,
+                        "reasoning_tokens": usage.reasoning_tokens,
+                        "cache_read_tokens": usage.cache_read_tokens,
+                    }
+            except Exception:
+                # Best-effort only; don't fail logging
+                pass
+
+            # Raw response *before* nonfncall -> call conversion
+            if raw_resp:
+                data["raw_response"] = (
+                    raw_resp  # ModelResponse | ResponsesAPIResponse;
+                    # serialized via _safe_json
+                )
+            # Pop duplicated tools to avoid logging twice
+            if (
+                "tools" in data
+                and isinstance(data.get("kwargs"), dict)
+                and "tools" in data["kwargs"]
+            ):
+                data["kwargs"].pop("tools")
+
+            log_data = json.dumps(data, default=_safe_json, ensure_ascii=False)
+
+            # Use callback if set (for remote execution), otherwise write to file
+            if self._log_completions_callback:
+                self._log_completions_callback(filename, log_data)
+            elif self.log_dir:
+                # Create log directory if it doesn't exist
+                os.makedirs(self.log_dir, exist_ok=True)
+                if not os.access(self.log_dir, os.W_OK):
+                    raise PermissionError(f"log_dir is not writable: {self.log_dir}")
+                fname = os.path.join(self.log_dir, filename)
+                with open(fname, "w", encoding="utf-8") as f:
+                    f.write(log_data)
+        except Exception as e:
+            warnings.warn(f"Telemetry logging failed: {e}")
+
+
+def _redact_request_credentials(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Return ``ctx`` with its logged request credentials copied and redacted.
+
+    The logged ``kwargs`` share their header dicts with the live call, and some
+    LiteLLM providers write ``Authorization`` into them in place. Copying here,
+    before the call, keeps such mutations and caller-supplied credential
+    options and headers out of completion logs.
+    """
+    kwargs = ctx.get("kwargs")
+    if not isinstance(kwargs, dict):
+        return ctx
+    logged_kwargs = {}
+    for key, value in kwargs.items():
+        if isinstance(value, (str, SecretStr)) and is_secret_key(key):
+            logged_kwargs[key] = sanitize_dict({key: value})[key]
+        else:
+            logged_kwargs[key] = sanitize_dict(value)
+    return {**ctx, "kwargs": logged_kwargs}
+
+
+_PRIVATE_MESSAGE_FIELDS = frozenset(
+    {"reasoning_content", "thinking_blocks", "reasoning_items"}
+)
+_PRIVATE_ITEM_TYPES = frozenset({"reasoning", "thinking", "redacted_thinking"})
+
+
+def _is_private_item(value: Any) -> bool:
+    return isinstance(value, dict) and value.get("type") in _PRIVATE_ITEM_TYPES
+
+
+def _without_reasoning(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_reasoning(item)
+            for key, item in value.items()
+            if key not in _PRIVATE_MESSAGE_FIELDS
+        }
+    if isinstance(value, list):
+        return [
+            _without_reasoning(item) for item in value if not _is_private_item(item)
+        ]
+    return value
+
+
+def _request_messages(ctx: dict[str, Any]) -> list[Any]:
+    if "messages" in ctx:
+        return list(ctx["messages"])
+    instructions = ctx.get("instructions")
+    system = [{"role": "system", "content": instructions}] if instructions else []
+    return system + list(ctx.get("input") or [])
+
+
+def _response_messages(resp: ModelResponse | ResponsesAPIResponse) -> list[Any]:
+    if isinstance(resp, ResponsesAPIResponse):
+        return list(resp.output)
+    return [
+        choice.message.model_dump(mode="json", exclude_none=True)
+        for choice in resp.choices
+        if isinstance(choice, Choices)
+    ]
+
+
+def _safe_json(obj: Any) -> Any:
+    # Centralized serializer for telemetry logs.
+    # Prefer robust serialization for Pydantic models first to avoid cycles.
+    if isinstance(obj, SecretStr):
+        return str(obj)
+
+    # Typed LiteLLM responses
+    if isinstance(obj, ModelResponse) or isinstance(obj, ResponsesAPIResponse):
+        return obj.model_dump(mode="json", exclude_none=True)
+
+    # Any Pydantic BaseModel (e.g., ToolDefinition, ChatCompletionToolParam, etc.)
+    if isinstance(obj, BaseModel):
+        # Use Pydantic's serializer which respects field exclusions (e.g., executors)
+        return obj.model_dump(mode="json", exclude_none=True)
+
+    # Fallbacks for other non-serializable objects used elsewhere in the log payload
+    try:
+        return obj.__dict__
+    except Exception:
+        return str(obj)

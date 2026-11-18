@@ -1,0 +1,203 @@
+"""
+Test that discriminated union schemas in OpenAPI have proper discriminator fields.
+
+This ensures that Swagger UI can properly display discriminated unions instead of
+showing them as "object | object | object...".
+"""
+
+import pytest
+from fastapi.testclient import TestClient
+
+from openhands.agent_server.api import create_app
+
+
+@pytest.fixture
+def client():
+    """Create a test client for the API."""
+    return TestClient(create_app())
+
+
+def test_action_schema_has_discriminator(client):
+    """Test that Action schema has proper discriminator field."""
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+
+    openapi_schema = response.json()
+
+    # Check that Action schema exists
+    assert "components" in openapi_schema
+    assert "schemas" in openapi_schema["components"]
+    schemas = openapi_schema["components"]["schemas"]
+
+    names = ["Action"] if "Action" in schemas else ["Action-Input", "Action-Output"]
+    for name in names:
+        assert name in schemas, f"{name} schema should be in components/schemas"
+        action_schema = schemas[name]
+
+        assert "oneOf" in action_schema, f"{name} should have oneOf field"
+        assert action_schema["oneOf"], f"{name} should have at least one variant"
+        for variant in action_schema["oneOf"]:
+            assert "$ref" in variant, f"Each variant should be a $ref, got: {variant}"
+
+        assert "discriminator" in action_schema, (
+            f"{name} should have discriminator field for proper OpenAPI documentation"
+        )
+        assert action_schema["discriminator"]["propertyName"] == "kind"
+
+
+def test_observation_schema_has_discriminator(client):
+    """Test that Observation schema has proper discriminator field."""
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+
+    openapi_schema = response.json()
+    schemas = openapi_schema["components"]["schemas"]
+
+    # Observation schema should also exist and have discriminator
+    if "Observation" in schemas:
+        observation_schema = schemas["Observation"]
+
+        if "oneOf" in observation_schema:
+            # Check that it has discriminator
+            assert "discriminator" in observation_schema, (
+                "Observation should have discriminator field"
+            )
+
+            discriminator = observation_schema["discriminator"]
+            assert "propertyName" in discriminator, (
+                "discriminator should have propertyName field"
+            )
+            assert discriminator["propertyName"] == "kind", (
+                "discriminator propertyName should be 'kind'"
+            )
+
+
+def test_event_schema_has_discriminator(client):
+    """Test that Event schema has proper discriminator field if it uses oneOf."""
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+
+    openapi_schema = response.json()
+    schemas = openapi_schema["components"]["schemas"]
+
+    # Event schema might also be a discriminated union
+    if "Event" in schemas:
+        event_schema = schemas["Event"]
+
+        if "oneOf" in event_schema:
+            # Check that it has discriminator
+            assert "discriminator" in event_schema, (
+                "Event should have discriminator field"
+            )
+
+            discriminator = event_schema["discriminator"]
+            assert "propertyName" in discriminator, (
+                "discriminator should have propertyName field"
+            )
+            assert discriminator["propertyName"] == "kind", (
+                "discriminator propertyName should be 'kind'"
+            )
+
+
+def test_action_variants_have_proper_schemas(client):
+    """Test that Action variants (FinishAction, etc.) have proper schemas."""
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+
+    openapi_schema = response.json()
+    schemas = openapi_schema["components"]["schemas"]
+
+    action_schema = schemas.get("Action", {})
+    one_of = action_schema.get("oneOf", [])
+
+    # Extract action type names from $refs
+    action_types = []
+    for variant in one_of:
+        ref = variant.get("$ref", "")
+        if ref.startswith("#/components/schemas/"):
+            type_name = ref.split("/")[-1]
+            action_types.append(type_name)
+
+    # Check that referenced schemas exist and are proper objects
+    for action_type in action_types:
+        assert action_type in schemas, f"{action_type} should be in schemas"
+
+        type_schema = schemas[action_type]
+
+        # Should be an object
+        assert type_schema.get("type") == "object", f"{action_type} should be an object"
+
+        # Should have properties
+        assert "properties" in type_schema, f"{action_type} should have properties"
+
+        # Should have kind field with const value matching the type name
+        properties = type_schema["properties"]
+        assert "kind" in properties, f"{action_type} should have 'kind' field"
+
+        kind_field = properties["kind"]
+        assert "const" in kind_field or "enum" in kind_field, (
+            f"{action_type}.kind should have const or enum"
+        )
+
+        # If const, it should match the type name
+        if "const" in kind_field:
+            assert kind_field["const"] == action_type, (
+                f"{action_type}.kind const should be '{action_type}'"
+            )
+
+        # Should have title
+        assert "title" in type_schema, (
+            f"{action_type} should have title for better docs"
+        )
+
+
+def test_conversation_contracts_use_unified_acp_capable_endpoint(client):
+    """The main conversation endpoint accepts both OpenHands and ACP agents."""
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+
+    openapi_schema = response.json()
+    schemas = openapi_schema["components"]["schemas"]
+
+    request = schemas["StartConversationRequest"]
+    agent_property = request["properties"]["agent"]
+    agent_ref = agent_property.get("$ref") or agent_property["anyOf"][0]["$ref"]
+    agent_schema = schemas[agent_ref.split("/")[-1]]
+    assert "oneOf" in agent_schema
+    refs = {variant["$ref"] for variant in agent_schema["oneOf"]}
+    assert "#/components/schemas/Agent-Input" in refs
+    assert "#/components/schemas/ACPAgent-Input" in refs
+    assert "agent_settings" in request["properties"]
+    assert "agent" not in request.get("required", [])
+
+    response_schema = schemas["ConversationInfo"]
+    response_agent_schema = schemas[
+        response_schema["properties"]["agent"]["$ref"].split("/")[-1]
+    ]
+    assert "oneOf" in response_agent_schema
+    response_refs = {variant["$ref"] for variant in response_agent_schema["oneOf"]}
+    assert "#/components/schemas/Agent-Output" in response_refs
+    assert "#/components/schemas/ACPAgent-Output" in response_refs
+    assert "ACPConversationInfo" not in schemas
+
+    page_schema = schemas["ConversationPage"]
+    page_items = page_schema["properties"]["items"]["items"]
+    assert page_items["$ref"] == "#/components/schemas/ConversationInfo"
+
+    assert "/api/v2/conversations" not in openapi_schema["paths"]
+    assert "/api/conversations" in openapi_schema["paths"]
+    # The deprecated /api/acp/conversations routes were removed in v1.27.0.
+    assert "/api/acp/conversations" not in openapi_schema["paths"]
+
+
+@pytest.mark.parametrize("name", ["DelegateAction", "DelegateObservation"])
+def test_legacy_delegate_schemas_are_deprecated_but_still_available(client, name):
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+    schemas = response.json()["components"]["schemas"]
+    variants = [schema for schema in schemas.values() if schema.get("title") == name]
+    assert variants
+    for schema in variants:
+        assert schema["deprecated"] is True
+        assert "1.60.0" in schema["description"]
+        assert schema["properties"]["kind"]["const"] == name

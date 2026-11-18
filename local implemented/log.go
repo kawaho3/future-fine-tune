@@ -1,0 +1,135 @@
+// Copyright 2025 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package log
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	slogger "github.com/alibaba/opensandbox/internal/logger"
+	"github.com/alibaba/opensandbox/internal/safego"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+const logFileEnvKey = "EXECD_LOG_FILE"
+
+type loggerState struct {
+	legacy slogger.Logger
+	native *zap.Logger
+}
+
+var current *loggerState
+
+// Init constructs the singleton logger. Call once during startup.
+// Legacy levels: 0/1/2=fatal, 3=error, 4=warn, 5/6=info, 7+=debug.
+func Init(level int) {
+	current = newLogger(mapLevel(level))
+	safego.InitPanicLogger(context.Background(), current.legacy)
+}
+
+func mapLevel(level int) string {
+	switch {
+	case level <= 2:
+		return "fatal"
+	case level == 3:
+		return "error"
+	case level == 4:
+		return "warn"
+	case level == 5 || level == 6:
+		return "info"
+	default:
+		return "debug"
+	}
+}
+
+func newLogger(level string) *loggerState {
+	cfg := slogger.Config{
+		Level: level,
+	}
+	if logFile := os.Getenv(logFileEnvKey); logFile != "" {
+		cfg.OutputPaths = []string{logFile}
+		cfg.ErrorOutputPaths = cfg.OutputPaths
+	}
+	legacy := slogger.MustNew(cfg)
+	sugar, ok := slogger.AsZapSugared(legacy)
+	if !ok {
+		panic("execd log: constructed logger has no native Zap accessor")
+	}
+	return &loggerState{legacy: legacy, native: sugar.Desugar()}
+}
+
+func getLogger() *loggerState {
+	if current != nil {
+		return current
+	}
+	l := newLogger("info")
+	current = l
+	return l
+}
+
+// InfoWithCommandID preserves formatted-message sampling and adds only correlation.
+func InfoWithCommandID(commandID, format string, args ...any) {
+	logWithCommandID(zap.InfoLevel, commandID, format, args...)
+}
+
+func WarnWithCommandID(commandID, format string, args ...any) {
+	logWithCommandID(zap.WarnLevel, commandID, format, args...)
+}
+
+func ErrorWithCommandID(commandID, format string, args ...any) {
+	logWithCommandID(zap.ErrorLevel, commandID, format, args...)
+}
+
+func logWithCommandID(level zapcore.Level, commandID, format string, args ...any) {
+	logger := getLogger().native
+	if !logger.Core().Enabled(level) {
+		return
+	}
+	message := format
+	switch {
+	case len(args) == 0:
+	case format != "":
+		message = fmt.Sprintf(format, args...)
+	case len(args) == 1:
+		if text, ok := args[0].(string); ok {
+			message = text
+		} else {
+			message = fmt.Sprint(args...)
+		}
+	default:
+		message = fmt.Sprint(args...)
+	}
+	if event := logger.Check(level, message); event != nil {
+		if commandID == "" {
+			event.Write()
+		} else {
+			event.Write(zap.String("command_id", commandID))
+		}
+	}
+}
+
+func Info(format string, args ...any) {
+	getLogger().legacy.Infof(format, args...)
+}
+
+func Warn(format string, args ...any) {
+	getLogger().legacy.Warnf(format, args...)
+}
+
+func Error(format string, args ...any) {
+	getLogger().legacy.Errorf(format, args...)
+}

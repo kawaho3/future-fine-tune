@@ -1,0 +1,203 @@
+# Copyright 2026 The OpenSandbox Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Shared CLI utilities: duration parsing, output selection, error handling, key-value parsing."""
+
+from __future__ import annotations
+
+import functools
+import json
+import re
+import sys
+from datetime import timedelta
+
+import click
+from pydantic import ValidationError
+
+from opensandbox_cli.client import ClientContext
+
+_DURATION_RE = re.compile(
+    r"^(?:(?P<hours>\d+)h)?(?:(?P<minutes>\d+)m)?(?:(?P<seconds>\d+)s)?$"
+)
+
+
+def parse_duration(value: str) -> timedelta:
+    """Parse ``10m``, ``1h30m``, ``90s``, etc.; a plain integer is seconds."""
+    value = value.strip()
+    if not value:
+        raise click.BadParameter("Duration cannot be empty")
+
+    if value.isdigit():
+        try:
+            return timedelta(seconds=int(value))
+        except (OverflowError, ValueError) as exc:
+            raise click.BadParameter(f"Duration '{value}' is out of range") from exc
+
+    m = _DURATION_RE.match(value)
+    if not m or not m.group(0):
+        raise click.BadParameter(
+            f"Invalid duration '{value}'. Use format like 10m, 1h30m, 90s."
+        )
+
+    try:
+        hours = int(m.group("hours") or 0)
+        minutes = int(m.group("minutes") or 0)
+        seconds = int(m.group("seconds") or 0)
+        return timedelta(hours=hours, minutes=minutes, seconds=seconds)
+    except (OverflowError, ValueError) as exc:
+        raise click.BadParameter(f"Duration '{value}' is out of range") from exc
+
+
+def parse_nullable_duration(value: str) -> timedelta | None:
+    """Parse a duration string, or return None for ``none`` (manual cleanup)."""
+    normalized = value.strip().lower()
+    if normalized == "none":
+        return None
+    return parse_duration(value)
+
+
+class DurationType(click.ParamType):
+    """Click parameter type for duration strings."""
+
+    name = "duration"
+
+    def convert(
+        self, value: str, param: click.Parameter | None, ctx: click.Context | None
+    ) -> timedelta:
+        if isinstance(value, timedelta):
+            return value
+        try:
+            return parse_duration(value)
+        except click.BadParameter as exc:
+            self.fail(exc.format_message(), param, ctx)
+
+
+DURATION = DurationType()
+
+
+class KeyValueType(click.ParamType):
+    """Click parameter type that parses ``KEY=VALUE`` strings into a tuple."""
+
+    name = "KEY=VALUE"
+
+    def convert(
+        self, value: str, param: click.Parameter | None, ctx: click.Context | None
+    ) -> tuple[str, str]:
+        if isinstance(value, tuple):
+            return value
+        if "=" not in value:
+            self.fail(f"Expected KEY=VALUE format, got '{value}'", param, ctx)
+        key, _, val = value.partition("=")
+        return (key, val)
+
+
+KEY_VALUE = KeyValueType()
+
+
+def load_json_object(path: str) -> dict:
+    """Load a JSON object from a file, with CLI-friendly errors."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(
+            f"Invalid JSON in request file '{path}': {exc}"
+        ) from exc
+    except (OSError, UnicodeError) as exc:
+        raise click.ClickException(
+            f"Cannot read request file '{path}': {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise click.ClickException(
+            f"Request file '{path}' must contain a JSON object."
+        )
+    return data
+
+
+def validation_message(exc: ValidationError) -> str:
+    """Format a pydantic ``ValidationError`` as a compact one-line message."""
+    parts = []
+    for error in exc.errors():
+        loc = ".".join(str(part) for part in error["loc"])
+        parts.append(f"{loc}: {error['msg']}" if loc else error["msg"])
+    return "; ".join(parts)
+
+
+def output_option(
+    *choices: str,
+    default: str | None = None,
+    help_text: str | None = None,
+):
+    """Attach a command-scoped output option."""
+    option_help = help_text or f"Output format: {', '.join(choices)}."
+    return click.option(
+        "-o",
+        "--output",
+        "output_format",
+        type=click.Choice(list(choices), case_sensitive=False),
+        default=default,
+        show_default=default is not None,
+        help=option_help,
+    )
+
+
+def prepare_output(
+    obj: ClientContext,
+    requested: str | None,
+    *,
+    allowed: tuple[str, ...],
+    fallback: str,
+):
+    """Resolve and attach the formatter for the current command."""
+    if requested:
+        if requested not in allowed:
+            allowed_list = ", ".join(allowed)
+            raise click.ClickException(
+                f"This command does not support `-o {requested}`. Allowed values: {allowed_list}."
+            )
+        fmt = requested
+    else:
+        fmt = fallback
+    return obj.make_output(fmt)
+
+
+def handle_errors(fn):  # type: ignore[no-untyped-def]
+    """Decorator that catches SDK / HTTP exceptions and prints a friendly message."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        try:
+            return fn(*args, **kwargs)
+        except (click.exceptions.Exit, click.ClickException):
+            raise
+        except Exception as exc:
+            from opensandbox.exceptions import SandboxException
+
+            ctx = click.get_current_context(silent=True)
+            obj = getattr(ctx, "obj", None) if ctx else None
+            output = getattr(obj, "output", None) if obj else None
+
+            if output and hasattr(output, "error_panel"):
+                if isinstance(exc, SandboxException):
+                    output.error_panel(str(exc), title="Sandbox Error")
+                else:
+                    output.error_panel(
+                        f"{exc}\n\nType: {type(exc).__qualname__}",
+                        title=type(exc).__name__,
+                    )
+            else:
+                click.secho(f"Error: {exc}", fg="red", err=True)
+            sys.exit(1)
+
+    return wrapper

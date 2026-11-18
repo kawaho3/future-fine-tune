@@ -1,0 +1,261 @@
+"""Common test fixtures and utilities."""
+
+import os
+import re
+import uuid
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+import pytest_forked
+from pydantic import SecretStr
+from pytest_forked import serialize_report
+
+from openhands.sdk import Agent
+from openhands.sdk.conversation.state import ConversationState
+from openhands.sdk.io import InMemoryFileStore
+from openhands.sdk.llm import LLM
+from openhands.sdk.skills.skill import (
+    PUBLIC_CATALOG_ENABLED_ENV,
+    PUBLIC_SKILLS_ENABLED_ENV,
+    PUBLIC_SKILLS_PATH_ENV,
+    _invalidate_public_skills_cache,
+)
+from openhands.sdk.tool import ToolExecutor
+from openhands.sdk.workspace import LocalWorkspace
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TOKENIZER_FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "tokenizers"
+QWEN3_TOKENIZER_CONFIG = (
+    TOKENIZER_FIXTURES_DIR / "qwen3-4b-instruct-2507-tokenizer_config.json"
+)
+
+# Settings that point an agent server at, or authenticate it to, a live
+# deployment. A run inside an OpenHands sandbox inherits them from the sandbox.
+_LIVE_DEPLOYMENT_ENV = re.compile(
+    r"SESSION_API_KEY|OH_SESSION_API_KEYS_\d+|OH_WEBHOOKS(_\w+)?"
+    r"|OH_CONVERSATIONS_PATH|OH_BASH_EVENTS_DIR|OH_INTERNAL_SERVER_URL"
+    r"|OH_LLM_API_KEY_REFRESH_\w+"
+)
+
+
+def _serialize_forked_report(report: pytest.TestReport) -> dict[str, object]:
+    data = serialize_report(report)
+    # pytest 9.2 stores a NodeId in _id, which marshal cannot serialize.
+    data["nodeid"] = report.nodeid
+    data.pop("_id", None)
+    return data
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    pytest_forked.serialize_report = _serialize_forked_report
+    # Before collection: some modules read the agent-server config at import.
+    for name in [n for n in os.environ if _LIVE_DEPLOYMENT_ENV.fullmatch(n)]:
+        del os.environ[name]
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    group = parser.getgroup("examples")
+    group.addoption(
+        "--run-examples",
+        action="store_true",
+        default=False,
+        help="Execute example scripts. Disabled by default for faster test runs.",
+    )
+    group.addoption(
+        "--examples-results-dir",
+        action="store",
+        default=None,
+        help=(
+            "Directory to store per-example JSON results "
+            "(defaults to .example-test-results)."
+        ),
+    )
+
+
+@pytest.fixture(scope="session")
+def examples_enabled(pytestconfig: pytest.Config) -> bool:
+    return bool(pytestconfig.getoption("--run-examples"))
+
+
+@pytest.fixture(scope="session")
+def examples_results_dir(pytestconfig: pytest.Config) -> Path:
+    configured = pytestconfig.getoption("--examples-results-dir")
+    result_dir = (
+        Path(configured)
+        if configured is not None
+        else REPO_ROOT / ".example-test-results"
+    )
+    result_dir.mkdir(parents=True, exist_ok=True)
+    if not hasattr(pytestconfig, "workerinput"):
+        for existing in result_dir.glob("*.json"):
+            existing.unlink()
+    return result_dir
+
+
+@pytest.fixture(scope="session")
+def tokenizer_fixtures_dir() -> Path:
+    """Get the tokenizer fixtures directory path."""
+    return TOKENIZER_FIXTURES_DIR
+
+
+@pytest.fixture(scope="session")
+def qwen3_tokenizer_config_path(tokenizer_fixtures_dir: Path) -> Path:
+    """Path to the cached Qwen3 tokenizer config fixture."""
+    return tokenizer_fixtures_dir / "qwen3-4b-instruct-2507-tokenizer_config.json"
+
+
+@pytest.fixture
+def mock_llm():
+    """Create a standard mock LLM instance for testing."""
+    return LLM(
+        model="gpt-4o",
+        api_key=SecretStr("test-key"),
+        usage_id="test-llm",
+        num_retries=2,
+        retry_min_wait=1,
+        retry_max_wait=2,
+    )
+
+
+@pytest.fixture
+def mock_conversation_state(mock_llm, tmp_path):
+    """Create a standard mock ConversationState for testing."""
+    agent = Agent(llm=mock_llm)
+    workspace = LocalWorkspace(working_dir=str(tmp_path))
+
+    state = ConversationState(
+        id=uuid.uuid4(),
+        workspace=workspace,
+        persistence_dir=str(tmp_path / ".state"),
+        agent=agent,
+    )
+
+    # Set up filestore for state persistence
+    state._fs = InMemoryFileStore()
+    state._autosave_enabled = False
+
+    return state
+
+
+@pytest.fixture
+def mock_tool():
+    """Create a mock tool for testing."""
+
+    class MockExecutor(ToolExecutor):
+        def __call__(self, action, conversation=None):
+            return MagicMock(output="mock output", metadata=MagicMock(exit_code=0))
+
+    # Create a simple mock tool without complex dependencies
+    mock_tool = MagicMock()
+    mock_tool.name = "mock_tool"
+    mock_tool.executor = MockExecutor()
+    return mock_tool
+
+
+@pytest.fixture
+def public_repo(tmp_path, monkeypatch):
+    """Point the default public skills source at a local `github` + `public-only`
+    repository, with both public-extension switches unset."""
+    for name in ("github", "public-only"):
+        skill_dir = tmp_path / "public" / "skills" / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name}\n---\nPUBLIC-{name}\n"
+        )
+    monkeypatch.setenv(PUBLIC_SKILLS_PATH_ENV, str(tmp_path / "public"))
+    monkeypatch.delenv(PUBLIC_SKILLS_ENABLED_ENV, raising=False)
+    monkeypatch.delenv(PUBLIC_CATALOG_ENABLED_ENV, raising=False)
+    _invalidate_public_skills_cache()
+    yield tmp_path / "public"
+    _invalidate_public_skills_cache()
+
+
+@pytest.fixture
+def no_locale_env(monkeypatch):
+    """Unset what tmux reads to choose UTF-8 output, and restore it afterwards.
+
+    setenv before delenv makes monkeypatch record each original, so a value the
+    code under test sets is removed too.
+    """
+    for name in ("LC_ALL", "LC_CTYPE", "LANG", "TMUX"):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+def create_mock_litellm_response(
+    content: str = "Test response",
+    response_id: str = "test-id",
+    model: str = "gpt-4o",
+    prompt_tokens: int = 10,
+    completion_tokens: int = 5,
+    finish_reason: str = "stop",
+):
+    """Helper function to create properly structured LiteLLM mock responses.
+
+    Args:
+        content: Response content
+        response_id: Unique response ID
+        model: Model name
+        prompt_tokens: Number of prompt tokens
+        completion_tokens: Number of completion tokens
+        finish_reason: Reason for completion
+    """
+    from litellm.types.utils import (
+        Choices,
+        Message as LiteLLMMessage,
+        ModelResponse,
+        Usage,
+    )
+
+    # Create proper LiteLLM message
+    message = LiteLLMMessage(content=content, role="assistant")
+
+    # Create proper choice
+    choice = Choices(finish_reason=finish_reason, index=0, message=message)
+
+    # Create proper usage
+    usage = Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
+
+    # Create proper ModelResponse
+    response = ModelResponse(
+        id=response_id,
+        choices=[choice],
+        created=1234567890,
+        model=model,
+        object="chat.completion",
+        usage=usage,
+    )
+
+    return response
+
+
+@pytest.fixture(autouse=True)
+def suppress_logging(monkeypatch):
+    """Suppress logging during tests to reduce noise."""
+    mock_logger = MagicMock()
+    monkeypatch.setattr("openhands.sdk.llm.llm.logger", mock_logger)
+
+
+@pytest.fixture(autouse=True)
+def restore_observability_latch():
+    """Keep one test's tracing setup from changing how every later test behaves.
+
+    ``should_enable_observability`` caches ``True`` in a module global that is
+    never re-checked, and ``Laminar.shutdown()`` does not clear it. A test that
+    brings lmnr up therefore leaves every later ``@observe`` building its real
+    wrapper on first call — which silently breaks tests that trigger that lazy
+    build themselves, and only when they share an xdist worker.
+    """
+    from openhands.sdk.observability import laminar
+
+    previous = laminar._observability_enabled
+    try:
+        yield
+    finally:
+        laminar._observability_enabled = previous

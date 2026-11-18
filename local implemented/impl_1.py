@@ -1,0 +1,979 @@
+"""Browser tool executor implementation using browser-use MCP server wrapper."""
+
+from __future__ import annotations
+
+import builtins
+import functools
+import importlib.util
+import json
+import logging
+import os
+import shutil
+import sys
+import threading
+import time
+from collections.abc import Callable, Coroutine
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Final, TypeVar
+from uuid import uuid4
+
+import psutil
+
+
+if TYPE_CHECKING:
+    from openhands.sdk.conversation import LocalConversation
+
+from openhands.sdk.logger import DEBUG, get_logger
+from openhands.sdk.tool import ToolExecutor
+from openhands.sdk.utils.async_executor import AsyncExecutor
+from openhands.tools.browser_use.definition import (
+    BROWSER_RECORDING_OUTPUT_DIR,
+    BrowserAction,
+    BrowserObservation,
+)
+from openhands.tools.browser_use.server import CustomBrowserUseServer
+from openhands.tools.utils.timeout import (
+    TimeoutError as ToolTimeoutError,
+    run_with_timeout,
+)
+
+
+F = TypeVar("F", bound=Callable[..., Coroutine[Any, Any, Any]])
+
+
+def recording_aware(
+    func: Callable[..., Coroutine[Any, Any, Any]],
+) -> Callable[..., Coroutine[Any, Any, Any]]:
+    """Decorator that handles recording flush before/after navigation operations.
+
+    This decorator:
+    1. Flushes recording events before the operation (to preserve them)
+    2. Executes the operation
+    3. Restarts recording on the new page if recording was active
+
+    Error Handling Policy (see recording.py module docstring for full details):
+    - Recording is a secondary feature that should never block browser operations
+    - AttributeError: silent pass (recording not initialized - expected)
+    - Other exceptions: log at DEBUG, don't interrupt navigation
+    """
+
+    @functools.wraps(func)
+    async def wrapper(self: BrowserToolExecutor, *args: Any, **kwargs: Any) -> Any:
+        is_recording = self._server._is_recording
+        if is_recording:
+            try:
+                await self._server._flush_recording_events()
+            except AttributeError:
+                # Recording not initialized - expected, silent pass
+                pass
+            except Exception as e:
+                # Internal operation: log at DEBUG, don't interrupt navigation
+                logger.debug(f"Recording flush before {func.__name__} skipped: {e}")
+
+        result = await func(self, *args, **kwargs)
+
+        if is_recording:
+            try:
+                await self._server._restart_recording_on_new_page()
+            except AttributeError:
+                # Recording not initialized - expected, silent pass
+                pass
+            except Exception as e:
+                # Internal operation: log at DEBUG, don't interrupt navigation
+                logger.debug(f"Recording restart after {func.__name__} skipped: {e}")
+
+        return result
+
+    return wrapper
+
+
+# Suppress browser-use logging for cleaner integration
+if DEBUG:
+    logging.getLogger("browser_use").setLevel(logging.DEBUG)
+else:
+    logging.getLogger("browser_use").setLevel(logging.WARNING)
+
+logger = get_logger(__name__)
+
+DEFAULT_BROWSER_ACTION_TIMEOUT_SECONDS: Final[float] = 300.0
+# After this many consecutive failures, reset the browser session
+# (assumes the browser has crashed or become unrecoverable).
+MAX_CONSECUTIVE_FAILURES: Final[int] = 3
+# Shorter timeout used after a failure to avoid long cascading waits
+# against a dead browser.
+DEGRADED_TIMEOUT_SECONDS: Final[float] = 30.0
+
+
+def _current_platform(platform: str | None = None) -> str:
+    return sys.platform if platform is None else platform
+
+
+def _windows_browser_install_paths() -> list[Path]:
+    roots = [
+        os.environ.get("PROGRAMFILES") or "C:\\Program Files",
+        os.environ.get("PROGRAMFILES(X86)") or "C:\\Program Files (x86)",
+        os.environ.get("LOCALAPPDATA"),
+    ]
+    browsers = [
+        ("Google", "Chrome", "Application", "chrome.exe"),
+        ("Microsoft", "Edge", "Application", "msedge.exe"),
+        ("Chromium", "Application", "chrome.exe"),
+    ]
+
+    paths: list[Path] = []
+    for root in roots:
+        if not root:
+            continue
+        for parts in browsers:
+            paths.append(Path(root).joinpath(*parts))
+    return paths
+
+
+def _standard_chromium_paths(platform: str | None = None) -> list[Path]:
+    match _current_platform(platform):
+        case "darwin":
+            return [
+                Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+                Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            ]
+        case "win32":
+            return _windows_browser_install_paths()
+        case _:
+            return [
+                Path("/usr/bin/google-chrome"),
+                Path("/usr/bin/google-chrome-stable"),
+                Path("/usr/bin/chromium"),
+                Path("/usr/bin/chromium-browser"),
+                Path("/usr/bin/microsoft-edge"),
+                Path("/usr/bin/microsoft-edge-stable"),
+            ]
+
+
+def _playwright_hermetic_cache_dirs() -> list[Path]:
+    try:
+        spec = importlib.util.find_spec("playwright")
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return []
+
+    if spec is None or spec.submodule_search_locations is None:
+        return []
+
+    try:
+        return [
+            Path(package_root) / "driver" / "package" / ".local-browsers"
+            for package_root in spec.submodule_search_locations
+        ]
+    except (OSError, TypeError, ValueError):
+        return []
+
+
+def _playwright_cache_dirs(platform: str | None = None) -> list[Path]:
+    current_platform = _current_platform(platform)
+    dirs: list[Path] = []
+    # Windows resolves relative and hermetic paths below; other platforms
+    # retain their configured-cache-then-default-cache lookup.
+    if current_platform != "win32":
+        if (browsers_path := os.environ.get("PLAYWRIGHT_BROWSERS_PATH")) and (
+            browsers_path != "0"
+        ):
+            dirs.append(Path(browsers_path).expanduser())
+    match current_platform:
+        case "darwin":
+            dirs.append(Path.home() / "Library" / "Caches" / "ms-playwright")
+        case "win32":
+            if configured_path := os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+                if configured_path == "0":
+                    return _playwright_hermetic_cache_dirs()
+                try:
+                    cache_path = Path(configured_path).expanduser()
+                    if not cache_path.is_absolute():
+                        cache_path = Path(
+                            os.path.abspath(
+                                Path(os.environ.get("INIT_CWD") or os.getcwd())
+                                / cache_path
+                            )
+                        )
+                except (OSError, RuntimeError, ValueError):
+                    return []
+                return [cache_path]
+            if local_app_data := os.environ.get("LOCALAPPDATA"):
+                return [Path(local_app_data) / "ms-playwright"]
+            try:
+                return [Path.home() / "AppData" / "Local" / "ms-playwright"]
+            except RuntimeError:
+                return []
+        case _:
+            dirs.append(Path.home() / ".cache" / "ms-playwright")
+    return dirs
+
+
+def _playwright_chromium_paths(
+    chromium_dir: Path,
+    platform: str | None = None,
+) -> list[Path]:
+    match _current_platform(platform):
+        case "darwin":
+            return [
+                chromium_dir
+                / "chrome-mac-arm64"
+                / "Google Chrome for Testing.app"
+                / "Contents"
+                / "MacOS"
+                / "Google Chrome for Testing",
+                chromium_dir
+                / "chrome-mac"
+                / "Google Chrome for Testing.app"
+                / "Contents"
+                / "MacOS"
+                / "Google Chrome for Testing",
+                chromium_dir
+                / "chrome-mac"
+                / "Chromium.app"
+                / "Contents"
+                / "MacOS"
+                / "Chromium",
+            ]
+        case "win32":
+            return [
+                chromium_dir / "chrome-win64" / "chrome.exe",
+                chromium_dir / "chrome-win" / "chrome.exe",
+            ]
+        case _:
+            return [
+                chromium_dir / "chrome-linux64" / "chrome",
+                chromium_dir / "chrome-linux" / "chrome",
+            ]
+
+
+def _playwright_build_sort_key(chromium_dir: Path) -> tuple[int, str]:
+    prefix, separator, build = chromium_dir.name.rpartition("-")
+    try:
+        build_number = (
+            int(build)
+            if separator
+            and not prefix.endswith("-")
+            and build.isascii()
+            and build.isdigit()
+            else -1
+        )
+    except (OverflowError, ValueError):
+        build_number = -1
+    return build_number, str(chromium_dir).casefold()
+
+
+def _playwright_chromium_install_paths(
+    platform: str | None = None,
+) -> list[Path]:
+    current_platform = _current_platform(platform)
+    paths: list[Path] = []
+    chromium_dirs: list[Path] = []
+    for playwright_cache in _playwright_cache_dirs(current_platform):
+        try:
+            if not playwright_cache.exists():
+                continue
+            if current_platform == "win32":
+                cache_chromium_dirs = [
+                    *playwright_cache.glob("chromium-[0-9]*"),
+                    *playwright_cache.glob("chromium_win*_special-[0-9]*"),
+                ]
+            else:
+                cache_chromium_dirs = list(playwright_cache.glob("chromium-*"))
+        except (OSError, RuntimeError, ValueError):
+            if current_platform != "win32":
+                raise
+            continue
+        chromium_dirs.extend(cache_chromium_dirs)
+    if current_platform == "win32":
+        chromium_dirs.sort(key=_playwright_build_sort_key, reverse=True)
+    for chromium_dir in chromium_dirs:
+        paths.extend(_playwright_chromium_paths(chromium_dir, current_platform))
+    return paths
+
+
+def _is_browser_executable(path: Path, platform: str | None = None) -> bool:
+    current_platform = _current_platform(platform)
+    try:
+        if not path.exists():
+            return False
+        if current_platform != "win32":
+            return True
+        if not path.is_file() or not os.access(path, os.X_OK):
+            return False
+        with path.open("rb") as executable:
+            if executable.read(2) != b"MZ":
+                return False
+            executable.seek(0x3C)
+            pe_header_offset = int.from_bytes(executable.read(4), "little")
+            if pe_header_offset < 0x40:
+                return False
+            executable.seek(pe_header_offset)
+            return executable.read(4) == b"PE\x00\x00"
+    except (OSError, ValueError):
+        if current_platform != "win32":
+            raise
+        return False
+
+
+def _path_binary_candidates(platform: str | None = None) -> tuple[str, ...]:
+    if _current_platform(platform) == "win32":
+        return ("chrome", "msedge", "chromium")
+    return (
+        "google-chrome",
+        "chrome",
+        "chromium",
+        "chromium-browser",
+        "microsoft-edge",
+    )
+
+
+def _format_browser_operation_error(
+    error: BaseException, timeout_seconds: float | None = None
+) -> str:
+    if error_detail := str(error).strip():
+        pass
+    elif isinstance(error, builtins.TimeoutError):
+        error_detail = (
+            f"Operation timed out after {int(timeout_seconds)} seconds"
+            if timeout_seconds is not None
+            else "Operation timed out"
+        )
+    else:
+        error_detail = error.__class__.__name__
+    return f"Browser operation failed: {error_detail}"
+
+
+def _get_chromium_error_message() -> str:
+    """Get the error message for when Chromium is not available."""
+    return (
+        "Chromium is required for browser operations but is not installed.\n\n"
+        "To install Chromium, run one of the following commands:\n"
+        "  1. Using uvx (recommended): uvx playwright install chromium "
+        "--with-deps --no-shell\n"
+        "  2. Using pip: pip install playwright && playwright install chromium\n"
+        "  3. Using system package manager:\n"
+        "     - Ubuntu/Debian: sudo apt install chromium-browser\n"
+        "     - macOS: brew install chromium\n"
+        "     - Windows: winget install Chromium.Chromium\n\n"
+        "After installation, restart your application to use the browser tool."
+    )
+
+
+def _kill_processes(processes: list[psutil.Process], timeout: float = 3.0) -> None:
+    """Kill the processes that are still running and wait briefly for them.
+
+    Used for a browser that a timed-out cleanup left behind, which otherwise
+    outlives the conversation and the program (re-parented to PID 1).
+    """
+    killed: list[psutil.Process] = []
+    for process in processes:
+        try:
+            if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                process.kill()
+                killed.append(process)
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error as e:
+            logger.warning("Could not kill browser process %s: %s", process.pid, e)
+    if not killed:
+        return
+    logger.warning(
+        "Killed %d browser process(es) left running after cleanup", len(killed)
+    )
+    # Poll rather than wait(): Chromium is a direct child that asyncio's child
+    # watcher also waits on, and reaping it here makes asyncio log a bogus
+    # "exit status already read" for it.
+    deadline = time.monotonic() + timeout
+    while True:
+        survivors = [p for p in killed if _still_running(p)]
+        if not survivors or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    if survivors:
+        logger.warning(
+            "Browser process(es) still running after kill: %s",
+            ", ".join(str(p.pid) for p in survivors),
+        )
+
+
+def _still_running(process: psutil.Process) -> bool:
+    try:
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.Error:
+        return True
+
+
+class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
+    """Executor that wraps browser-use MCP server for OpenHands integration."""
+
+    _server: CustomBrowserUseServer
+    _config: dict[str, Any]
+    _initialized: bool
+    _async_executor: AsyncExecutor
+    _cleanup_initiated: bool
+    _close_lock: threading.Lock
+    _action_timeout_seconds: float
+
+    @staticmethod
+    @functools.cache
+    def check_chromium_available() -> str | None:
+        """Check if a Chromium/Chrome binary is available.
+
+        Returns:
+            Path to Chromium binary if found, None otherwise
+        """
+        current_platform = _current_platform()
+        path_sources = (
+            (_playwright_chromium_install_paths, _standard_chromium_paths)
+            if current_platform == "win32"
+            else (_standard_chromium_paths, _playwright_chromium_install_paths)
+        )
+
+        for path_source in path_sources:
+            for path in path_source(current_platform):
+                if _is_browser_executable(path, current_platform):
+                    return str(path)
+
+        # Fallback: check PATH for any chromium-based binary
+        for binary in _path_binary_candidates():
+            if path := shutil.which(binary):
+                if current_platform != "win32" or _is_browser_executable(
+                    Path(path), current_platform
+                ):
+                    return path
+
+        return None
+
+    def _ensure_chromium_available(self) -> str:
+        """Ensure Chromium is available for browser operations.
+
+        Raises:
+            Exception: If Chromium is not available
+        """
+        if _current_platform() == "win32":
+            BrowserToolExecutor.check_chromium_available.cache_clear()
+        if path := self.check_chromium_available():
+            logger.info(f"Chromium is available for browser operations at {path}")
+            return path
+
+        # Chromium not available - provide clear installation instructions
+        raise Exception(_get_chromium_error_message())
+
+    def __init__(
+        self,
+        headless: bool = True,
+        allowed_domains: list[str] | None = None,
+        session_timeout_minutes: int = 30,
+        init_timeout_seconds: int = 30,
+        action_timeout_seconds: float = DEFAULT_BROWSER_ACTION_TIMEOUT_SECONDS,
+        full_output_save_dir: str | None = None,
+        inject_scripts: list[str] | None = None,
+        **config,
+    ):
+        """Initialize BrowserToolExecutor with timeout protection.
+
+        Args:
+            headless: Whether to run browser in headless mode
+            allowed_domains: List of allowed domains for browser operations
+            session_timeout_minutes: Browser session timeout in minutes
+            init_timeout_seconds: Timeout for browser initialization in seconds
+            action_timeout_seconds: Timeout for each browser action in seconds
+            full_output_save_dir: Absolute path to directory to save full output
+                logs and files, used when truncation is needed.
+            inject_scripts: List of JavaScript code strings to inject into every
+                new document. Scripts are injected via CDP's
+                Page.addScriptToEvaluateOnNewDocument and run before page scripts.
+                Useful for injecting recording tools like rrweb.
+            **config: Additional configuration options
+        """
+
+        self._close_lock = threading.Lock()
+
+        def init_logic():
+            executable_path = (
+                config.pop("executable_path", None) or self._ensure_chromium_available()
+            )
+            self._server = CustomBrowserUseServer(
+                session_timeout_minutes=session_timeout_minutes,
+            )
+            # Configure scripts to inject
+            if inject_scripts:
+                self._server.set_inject_scripts(inject_scripts)
+
+            # Chromium refuses to run as root with sandboxing enabled.
+            # Disable the sandbox when running as root so CHROME_DOCKER_ARGS
+            # (--no-sandbox, --disable-setuid-sandbox, etc.) are applied.
+            # SECURITY: Running Chrome as root without a sandbox is risky
+            # - a compromised browser has full root access. Use only in
+            # controlled environments.
+            getuid = getattr(os, "getuid", None)
+            running_as_root = getuid is not None and getuid() == 0
+            if running_as_root:
+                logger.warning(
+                    "Running as root - disabling Chromium sandbox "
+                    "(required for root). This reduces security isolation."
+                )
+
+            self._config = {
+                "headless": headless,
+                "allowed_domains": allowed_domains or [],
+                "executable_path": executable_path,
+                "chromium_sandbox": not running_as_root,
+                "user_data_dir": str(
+                    Path.home() / ".config" / "browseruse" / "profiles" / uuid4().hex
+                ),
+                **config,
+            }
+
+        try:
+            run_with_timeout(init_logic, init_timeout_seconds)
+        except ToolTimeoutError:
+            raise Exception(
+                f"Browser tool initialization timed out after {init_timeout_seconds}s"
+            )
+
+        if action_timeout_seconds <= 0:
+            raise ValueError("action_timeout_seconds must be greater than 0")
+
+        self.full_output_save_dir: str | None = full_output_save_dir
+        self._initialized = False
+        self._async_executor = AsyncExecutor()
+        self._cleanup_initiated = False
+        self._action_timeout_seconds = action_timeout_seconds
+        self._consecutive_failures = 0
+
+    def __call__(
+        self,
+        action: BrowserAction,
+        conversation: LocalConversation | None = None,  # noqa: ARG002
+    ):
+        """Submit an action to run in the background loop and wait for result."""
+        # Use a shorter timeout on the last retry before a reset would trigger,
+        # to avoid long cascading waits against a dead browser.
+        effective_timeout = (
+            DEGRADED_TIMEOUT_SECONDS
+            if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES - 1
+            else self._action_timeout_seconds
+        )
+
+        try:
+            result = self._async_executor.run_async(
+                self._execute_action,
+                action,
+                timeout=effective_timeout,
+            )
+        except builtins.TimeoutError as error:
+            # Timeouts indicate the browser may be dead/hung — track them
+            # for crash detection. Regular action errors (invalid selector,
+            # missing element) are NOT counted since those are normal agent
+            # mistakes, not browser crashes.
+            return self._handle_timeout_failure(
+                _format_browser_operation_error(
+                    error, timeout_seconds=effective_timeout
+                )
+            )
+
+        self._consecutive_failures = 0
+        return result
+
+    def _handle_timeout_failure(self, error_text: str) -> BrowserObservation:
+        """Track consecutive timeout failures and reset session if needed."""
+        self._consecutive_failures += 1
+        logger.debug(
+            "Browser timeout failure %d/%d",
+            self._consecutive_failures,
+            MAX_CONSECUTIVE_FAILURES,
+        )
+
+        if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            logger.warning(
+                "Browser appears crashed (%d consecutive failures). "
+                "Resetting session for automatic recovery.",
+                self._consecutive_failures,
+            )
+            # Best-effort cleanup of the old browser process/session.
+            # If the browser truly crashed this will fail fast. A wedged
+            # browser can outlast the cleanup, so its processes are killed
+            # afterwards and the server forgets the session either way;
+            # otherwise the next action reuses the hung session.
+            processes = self._browser_processes()
+            try:
+                self._async_executor.run_async(self.cleanup, timeout=5.0)
+            except Exception as e:
+                logger.debug(
+                    "Cleanup during session reset failed "
+                    "(expected if browser crashed): %s",
+                    e,
+                )
+            _kill_processes(processes)
+            self._forget_browser_session()
+            self._initialized = False
+            self._consecutive_failures = 0
+            error_text = (
+                f"{error_text}\n\n"
+                "The browser session has been reset after multiple consecutive "
+                "failures (possible crash). The browser will be restarted on "
+                "the next action. Please retry your action."
+            )
+
+        return BrowserObservation.from_text(
+            text=error_text,
+            is_error=True,
+            full_output_save_dir=self.full_output_save_dir,
+        )
+
+    async def _execute_action(self, action):
+        """Execute browser action asynchronously."""
+        from openhands.tools.browser_use.definition import (
+            BrowserClickAction,
+            BrowserCloseTabAction,
+            BrowserGetContentAction,
+            BrowserGetStateAction,
+            BrowserGetStorageAction,
+            BrowserGoBackAction,
+            BrowserListTabsAction,
+            BrowserNavigateAction,
+            BrowserObservation,
+            BrowserScrollAction,
+            BrowserSetStorageAction,
+            BrowserStartRecordingAction,
+            BrowserStopRecordingAction,
+            BrowserSwitchTabAction,
+            BrowserTypeAction,
+        )
+
+        try:
+            result = ""
+            # Route to appropriate method based on action type
+            if isinstance(action, BrowserNavigateAction):
+                result = await self.navigate(action.url, action.new_tab)
+            elif isinstance(action, BrowserClickAction):
+                result = await self.click(action.index, action.new_tab)
+            elif isinstance(action, BrowserTypeAction):
+                result = await self.type_text(action.index, action.text)
+            elif isinstance(action, BrowserGetStateAction):
+                return await self.get_state(action.include_screenshot)
+            elif isinstance(action, BrowserGetStorageAction):
+                result = await self.get_storage()
+            elif isinstance(action, BrowserSetStorageAction):
+                result = await self.set_storage(action.storage_state)
+            elif isinstance(action, BrowserGetContentAction):
+                result = await self.get_content(
+                    action.extract_links, action.start_from_char
+                )
+            elif isinstance(action, BrowserScrollAction):
+                result = await self.scroll(action.direction)
+            elif isinstance(action, BrowserGoBackAction):
+                result = await self.go_back()
+            elif isinstance(action, BrowserListTabsAction):
+                result = await self.list_tabs()
+            elif isinstance(action, BrowserSwitchTabAction):
+                result = await self.switch_tab(action.tab_id)
+            elif isinstance(action, BrowserCloseTabAction):
+                result = await self.close_tab(action.tab_id)
+            elif isinstance(action, BrowserStartRecordingAction):
+                result = await self.start_recording()
+            elif isinstance(action, BrowserStopRecordingAction):
+                result = await self.stop_recording()
+            else:
+                error_msg = f"Unsupported action type: {type(action)}"
+                return BrowserObservation.from_text(
+                    text=error_msg,
+                    is_error=True,
+                    full_output_save_dir=self.full_output_save_dir,
+                )
+
+            return BrowserObservation.from_text(
+                text=result,
+                is_error=False,
+                full_output_save_dir=self.full_output_save_dir,
+            )
+        except Exception as error:
+            error_msg = _format_browser_operation_error(error)
+            logging.error(error_msg, exc_info=True)
+            return BrowserObservation.from_text(
+                text=error_msg,
+                is_error=True,
+                full_output_save_dir=self.full_output_save_dir,
+            )
+
+    async def _ensure_initialized(self):
+        """Ensure browser session is initialized."""
+        if not self._initialized:
+            # Initialize browser session with our config
+            await self._server._init_browser_session(**self._config)
+            # Inject any configured user scripts after session is ready
+            # Note: rrweb scripts are injected lazily when recording starts
+            await self._server._inject_scripts_to_session()
+            self._initialized = True
+
+    # Navigation & Browser Control Methods
+    @recording_aware
+    async def navigate(self, url: str, new_tab: bool = False) -> str:
+        """Navigate to a URL.
+
+        browser-use's MCP ``_navigate`` awaits the navigation event but never
+        reads its handler results, so a navigation its security watchdog refused
+        (``allowed_domains``) still reported success. Read the results here and
+        raise, so the observation is an error that names the blocked URL.
+        """
+        await self._ensure_initialized()
+        session = self._server.browser_session
+        if session is None:
+            return await self._server._navigate(url, new_tab)
+
+        from browser_use.browser.events import NavigateToUrlEvent
+
+        self._server._update_session_activity(session.id)
+        event = session.event_bus.dispatch(NavigateToUrlEvent(url=url, new_tab=new_tab))
+        await event
+        await event.event_result(raise_if_any=True, raise_if_none=False)
+        if new_tab:
+            return f"Opened new tab with URL: {url}"
+        return f"Navigated to: {url}"
+
+    @recording_aware
+    async def go_back(self) -> str:
+        """Go back in browser history."""
+        await self._ensure_initialized()
+        return await self._server._go_back()
+
+    # Page Interaction
+    @recording_aware
+    async def click(self, index: int, new_tab: bool = False) -> str:
+        """Click an element by index."""
+        await self._ensure_initialized()
+        return await self._server._click(index, new_tab)
+
+    async def type_text(self, index: int, text: str) -> str:
+        """Type text into an element."""
+        await self._ensure_initialized()
+        return await self._server._type_text(index, text)
+
+    async def scroll(self, direction: str = "down") -> str:
+        """Scroll the page."""
+        await self._ensure_initialized()
+        return await self._server._scroll(direction)
+
+    async def get_state(self, include_screenshot: bool = False):
+        """Get current browser state with interactive elements."""
+        from openhands.tools.browser_use.definition import BrowserObservation
+
+        await self._ensure_initialized()
+        result_json = await self._server._get_browser_state(include_screenshot)
+
+        if include_screenshot:
+            try:
+                result_data = json.loads(result_json)
+                screenshot_data = result_data.pop("screenshot", None)
+
+                # Return clean JSON + separate screenshot data
+                clean_json = json.dumps(result_data, indent=2)
+                return BrowserObservation.from_text(
+                    text=clean_json,
+                    is_error=False,
+                    screenshot_data=screenshot_data,
+                    full_output_save_dir=self.full_output_save_dir,
+                )
+            except json.JSONDecodeError:
+                # If JSON parsing fails, return as-is
+                pass
+
+        return BrowserObservation.from_text(
+            text=result_json,
+            is_error=False,
+            full_output_save_dir=self.full_output_save_dir,
+        )
+
+    async def get_storage(self) -> str:
+        """Get browser storage (cookies, local storage, session storage)."""
+        await self._ensure_initialized()
+        return await self._server._get_storage()
+
+    async def set_storage(self, storage_state: dict) -> str:
+        """Set browser storage (cookies, local storage, session storage)."""
+        await self._ensure_initialized()
+        return await self._server._set_storage(storage_state)
+
+    # Tab Management
+    async def list_tabs(self) -> str:
+        """List all open tabs."""
+        await self._ensure_initialized()
+        return await self._server._list_tabs()
+
+    async def switch_tab(self, tab_id: str) -> str:
+        """Switch to a different tab."""
+        await self._ensure_initialized()
+        return await self._server._switch_tab(tab_id)
+
+    async def close_tab(self, tab_id: str) -> str:
+        """Close a specific tab."""
+        await self._ensure_initialized()
+        return await self._server._close_tab(tab_id)
+
+    # Content Extraction
+    async def get_content(self, extract_links: bool, start_from_char: int) -> str:
+        """Extract page content, optionally with links."""
+        await self._ensure_initialized()
+        return await self._server._get_content(
+            extract_links=extract_links, start_from_char=start_from_char
+        )
+
+    # Session Recording
+    async def start_recording(self) -> str:
+        """Start recording the browser session using rrweb.
+
+        Recording events are periodically flushed to timestamped JSON files
+        in a session subfolder under BROWSER_RECORDING_OUTPUT_DIR.
+        Events are flushed every 5 seconds.
+        """
+        await self._ensure_initialized()
+        return await self._server._start_recording(
+            output_dir=BROWSER_RECORDING_OUTPUT_DIR
+        )
+
+    async def stop_recording(self) -> str:
+        """Stop recording and save remaining events to file.
+
+        Stops the periodic flush, collects any remaining events, and saves
+        them to a final numbered JSON file. Returns a summary message with
+        the total events and file count.
+        """
+        await self._ensure_initialized()
+        return await self._server._stop_recording()
+
+    async def close_browser(self) -> str:
+        """Close the browser session."""
+        if self._initialized:
+            result = await self._server._close_browser()
+            self._initialized = False
+            return result
+        return "No browser session to close"
+
+    async def cleanup(self):
+        """Cleanup browser resources."""
+        try:
+            # Use _close_all_sessions instead of close_browser because it calls
+            # session.kill() which properly stops the event bus and drains
+            # pending events (including BrowserKillEvent that terminates the
+            # Chromium subprocess). close_browser() alone dispatches
+            # BrowserKillEvent fire-and-forget and returns before it's processed,
+            # which can leave the browser process alive.
+            if hasattr(self._server, "_close_all_sessions"):
+                await self._server._close_all_sessions()
+            else:
+                await self.close_browser()
+        except Exception as e:
+            logger.warning(f"Error during browser cleanup: {e}")
+
+    def _browser_processes(self) -> list[psutil.Process]:
+        """The local browser process and its descendants, if one is running."""
+        # getattr: close() also runs on an executor whose __init__ failed.
+        server = getattr(self, "_server", None)
+        session = getattr(server, "browser_session", None)
+        watchdog = getattr(session, "_local_browser_watchdog", None)
+        process = getattr(watchdog, "_subprocess", None)
+        if not isinstance(process, psutil.Process):
+            return []
+        try:
+            return [process, *process.children(recursive=True)]
+        except psutil.Error:
+            return [process]
+
+    def _forget_browser_session(self) -> None:
+        """Drop the server's session references so the next action starts anew.
+
+        A cancelled cleanup leaves the old session's event bus running on the
+        portal loop, which then holds up the executor's close, so stop it too.
+        """
+        session = self._server.browser_session
+        self._server.browser_session = None
+        self._server.tools = None
+        self._server.active_sessions.clear()
+        event_bus = getattr(session, "event_bus", None)
+        if event_bus is None:
+            return
+        try:
+            self._async_executor.run_async(
+                event_bus.stop(clear=True, timeout=1), timeout=3.0
+            )
+        except Exception as e:
+            logger.debug("Stopping the old browser session's event bus failed: %s", e)
+
+    def close(self):
+        """Close the browser executor and cleanup resources."""
+        with self._close_lock:
+            shared_close_lock_acquired = self._detach_shared_executor_for_close()
+            if self._cleanup_initiated:
+                if shared_close_lock_acquired:
+                    self._release_shared_executor_creation_lock()
+                return
+            self._cleanup_initiated = True
+            processes = self._browser_processes()
+            try:
+                # Run cleanup in the async executor with a shorter timeout
+                self._async_executor.run_async(self.cleanup, timeout=30.0)
+            except Exception as e:
+                logger.warning(f"Error during browser cleanup: {e}")
+            finally:
+                # A hung browser can outlast the cleanup; don't leave it behind.
+                _kill_processes(processes)
+                # Remove the browser profile directory to avoid disk accumulation.
+                # browser_use doesn't clean up the user_data_dir on shutdown.
+                user_data_dir = self._config.get("user_data_dir")
+                if user_data_dir and "browseruse/profiles/" in user_data_dir:
+                    try:
+                        shutil.rmtree(user_data_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                try:
+                    # Always close the async executor
+                    self._async_executor.close()
+                finally:
+                    if shared_close_lock_acquired:
+                        self._release_shared_executor_creation_lock()
+                    else:
+                        self._release_shared_executor_reference()
+
+    def _detach_shared_executor_for_close(self) -> bool:
+        from openhands.tools.browser_use.definition import BrowserToolSet
+
+        if BrowserToolSet._shared_executor is not self:
+            return False
+
+        BrowserToolSet._shared_executor_creation_lock.acquire()
+        with BrowserToolSet._shared_executor_lock:
+            if BrowserToolSet._shared_executor is self:
+                BrowserToolSet._shared_executor = None
+                return True
+
+        BrowserToolSet._shared_executor_creation_lock.release()
+        return False
+
+    @staticmethod
+    def _release_shared_executor_creation_lock() -> None:
+        from openhands.tools.browser_use.definition import BrowserToolSet
+
+        BrowserToolSet._shared_executor_creation_lock.release()
+
+    def _release_shared_executor_reference(self):
+        # Avoid taking the shared executor lock for ordinary/stale executors.
+        # __del__ can run while BrowserToolSet.create() is creating a new shared
+        # executor; a stale executor finalizer trying to acquire the same lock can
+        # deadlock that create path, especially on Windows.
+        from openhands.tools.browser_use.definition import BrowserToolSet
+
+        if BrowserToolSet._shared_executor is not self:
+            return
+        with BrowserToolSet._shared_executor_lock:
+            if BrowserToolSet._shared_executor is self:
+                BrowserToolSet._shared_executor = None
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        try:
+            self.close()
+        except Exception:
+            pass  # Ignore cleanup errors during deletion
